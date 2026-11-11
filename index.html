@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TheMVP PC Health Check</title>
+<style>
+  :root { --ink: #231f20; --accent: #fecf0a; --bg: #f7f7f5; --card: #fff; --muted: #5f5b5c; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
+  header { background: var(--ink); color: #fff; padding: 20px 16px; }
+  header b { color: var(--accent); }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  .card { background: var(--card); border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  h1 { font-size: 1.4rem; margin: 0; }
+  h2 { font-size: 1.1rem; margin: 0 0 8px; }
+  label { font-weight: 600; display: block; margin-bottom: 6px; }
+  input { font: inherit; padding: 8px 10px; border: 1px solid #bbb; border-radius: 8px; width: 100%; max-width: 260px; }
+  .tabs { display: flex; gap: 8px; margin: 16px 0 8px; flex-wrap: wrap; }
+  .tabs button { font: inherit; padding: 6px 14px; border-radius: 999px; border: 1px solid var(--ink); background: #fff; cursor: pointer; }
+  .tabs button[aria-pressed="true"] { background: var(--ink); color: #fff; }
+  pre { background: var(--ink); color: #fff; padding: 14px; border-radius: 8px; white-space: pre-wrap; word-break: break-all; margin: 0 0 10px; font-size: .9rem; }
+  .copy { font: inherit; font-weight: 700; background: var(--accent); color: var(--ink); border: 0; border-radius: 8px; padding: 10px 18px; cursor: pointer; }
+  .copy:focus-visible, .tabs button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  ol, ul { padding-left: 20px; margin: 6px 0; }
+  .muted { color: var(--muted); font-size: .92rem; }
+</style>
+</head>
+<body>
+<header><h1><b>TheMVP</b> PC Health Check</h1></header>
+<main>
+  <div class="card">
+    <label for="ticket">Your ticket number</label>
+    <input id="ticket" placeholder="e.g. SID000616" autocomplete="off">
+
+    <div class="tabs" role="group" aria-label="Operating system">
+      <button type="button" data-os="windows">Windows</button>
+      <button type="button" data-os="linux">Linux</button>
+    </div>
+    <p id="where" class="muted"></p>
+    <pre id="cmd" aria-live="polite"></pre>
+    <button type="button" class="copy" id="copy">Copy command</button>
+    <ol id="steps"></ol>
+  </div>
+
+  <div class="card">
+    <h2>What it does</h2>
+    <ul>
+      <li>Lists your PC's parts first: processor, graphics card, memory, drives and motherboard.</li>
+      <li>Reads what your PC has already recorded: crashes, sudden shutdowns, hardware errors, drive health, temperatures and drivers.</li>
+      <li>Saves a report on your PC, with a plain-English summary, for you to send to TheMVP.</li>
+    </ul>
+    <h2>What it does not do</h2>
+    <ul>
+      <li>It does not open your personal files, photos, browser history or passwords.</li>
+      <li>It does not send anything by itself. You decide whether to send the report.</li>
+      <li>Windows: it does not install, change or delete anything.
+          Linux: it may install standard diagnostic tools (smartmontools, lm-sensors) from your distribution's own repository.</li>
+    </ul>
+    <p class="muted">The full source code is public in this repository. You can read every line before running it.</p>
+  </div>
+</main>
+<script>
+  // Raw-file root of this repository (set once when publishing).
+  const RAW = "https://raw.githubusercontent.com/mvp-support/pc-health-check/main";
+  const ticketBox = document.getElementById("ticket");
+  const tabs = document.querySelectorAll(".tabs button");
+
+  const clean = s => s.replace(/[^A-Za-z0-9]/g, "");
+  const COMMANDS = {
+    windows: t => `powershell -NoProfile -ExecutionPolicy Bypass -c "& ([scriptblock]::Create((irm ${RAW}/windows/run.ps1)))${t ? " -Ticket " + t : ""}"`,
+    linux: t => `u=${RAW}/linux/themvp-diag.sh; f=$(mktemp); (curl -fsSL $u || wget -qO- $u) > $f && sudo bash $f ${t || "NOTICKET"}; rm -f $f`
+  };
+  const WHERE = {
+    windows: "Press the Windows key, type cmd, press Enter. Paste the command (right-click) and press Enter.",
+    linux: "Open a Terminal (Ctrl+Alt+T on Ubuntu). Paste the command (Ctrl+Shift+V) and press Enter."
+  };
+  const STEPS = {
+    windows: ["Click Yes when Windows asks for permission.", "Wait about 1 minute and do not use the PC meanwhile.",
+              "A file named themvp-diag-….zip appears on your Desktop. Send us that file by replying to your ticket email."],
+    linux: ["Type your password when asked (it is not shown while typing).", "Wait about 4 minutes and do not use the PC meanwhile.",
+            "Send us the themvp-diag-….tar.gz file from your home folder by replying to your ticket email."]
+  };
+
+  function detect() {
+    const p = ((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent).toLowerCase();
+    return p.includes("linux") && !p.includes("android") ? "linux" : "windows";
+  }
+  let os = detect();
+
+  function render() {
+    tabs.forEach(b => b.setAttribute("aria-pressed", b.dataset.os === os));
+    document.getElementById("cmd").textContent = COMMANDS[os](clean(ticketBox.value.trim()));
+    document.getElementById("where").textContent = WHERE[os];
+    document.getElementById("steps").replaceChildren(...STEPS[os].map(s => Object.assign(document.createElement("li"), { textContent: s })));
+  }
+  tabs.forEach(b => b.addEventListener("click", () => { os = b.dataset.os; render(); }));
+  ticketBox.addEventListener("input", render);
+  const fromUrl = new URLSearchParams(location.search).get("ticket");   // link from the chatbot: ?ticket=SID000616
+  if (fromUrl) ticketBox.value = clean(fromUrl);
+
+  document.getElementById("copy").addEventListener("click", async e => {
+    try { await navigator.clipboard.writeText(document.getElementById("cmd").textContent); e.target.textContent = "Copied ✓"; }
+    catch { e.target.textContent = "Select the text above and copy it"; }
+    setTimeout(() => e.target.textContent = "Copy command", 2500);
+  });
+  render();
+</script>
+</body>
+</html>

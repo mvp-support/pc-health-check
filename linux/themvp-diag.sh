@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  TheMVP.in - Workstation Hang / Crash Diagnostic Collector  (Linux)
-#  Version: 1.2  (2026-11-06)  - ticket ID required in the file name, full previous-boot log
+#  Version: 1.3  (2026-11-12)  - ticket ID optional: without it the report is for the owner's own use
+#           1.2  (2026-11-06)  - ticket ID required in the file name, full previous-boot log
 #           1.1  (2026-10-31)  - adds idle / load / cooldown temperature logging
 #
-#  Usage:   sudo bash themvp-diag.sh <TICKET_ID> [--stress MIN] [--gpu-stress MIN] [--days N] [--no-install]
+#  Usage:   sudo bash themvp-diag.sh [TICKET_ID] [--stress MIN] [--gpu-stress MIN] [--days N] [--no-install]
 #  Example: sudo bash themvp-diag.sh SID000616                         (logs + idle temps, ~4 min)
 #           sudo bash themvp-diag.sh SID000616 --stress 15 --gpu-stress 15   (+ CPU/RAM and GPU load, temps every 5 s)
 #  Install as a command (once):  sudo install -m 755 themvp-diag.sh /usr/local/bin/themvp-diag
@@ -16,8 +17,8 @@
 #  smartmontools / rasdaemon / lm-sensors / stress-ng / gpu-burn (skip with --no-install).
 # =============================================================================
 
-VERSION="1.2"
-TICKET="${1:-NOTICKET}"; shift || true
+VERSION="1.3"
+TICKET=NOTICKET; case "${1:-}" in ""|-*) ;; *) TICKET="$1"; shift ;; esac   # no ticket: own-use run, options may come first
 TICKET="$(printf '%s' "$TICKET" | tr -cd 'A-Za-z0-9')"; [ -n "$TICKET" ] || TICKET=NOTICKET   # it becomes part of the file name
 STRESS_MIN=0; GPU_STRESS_MIN=0; DAYS=30; INSTALL=1
 while [ $# -gt 0 ]; do
@@ -544,7 +545,10 @@ echo
 cat "$SUM"
 echo
 if [ "$TICKET" = "NOTICKET" ]; then
-  echo "NOTE: no ticket number was given. Please run it again with your ticket number, e.g.  sudo bash $0 SID000616"
+  echo "DONE. Your results are shown above. A copy is saved as:"
+  echo "   $OUT.tar.gz"
+  echo "Need help with what it found? Email support@themvp.in or visit https://themvp.in"
+else
+  echo "DONE. Please email this file to support by replying to your ticket email:"
+  echo "   $OUT.tar.gz"
 fi
-echo "DONE. Please email this file to support by replying to your ticket email:"
-echo "   $OUT.tar.gz"

@@ -30,7 +30,9 @@
 <header><h1><b>TheMVP</b> PC Health Check</h1></header>
 <main>
   <div class="card">
-    <label for="ticket">Your ticket number</label>
+    <h2>Check your PC for free</h2>
+    <p class="muted" style="margin-top:0">Works on any Windows or Linux PC. No sign-up, and nothing is sent anywhere: the results open on your screen.</p>
+    <label for="ticket">TheMVP ticket number <span class="muted">(only if TheMVP Support asked you to run this)</span></label>
     <input id="ticket" placeholder="e.g. SID000616" autocomplete="off">
 
     <div class="tabs" role="group" aria-label="Operating system">
@@ -59,6 +61,11 @@
     </ul>
     <p class="muted">The full source code is public in this repository. You can read every line before running it.</p>
   </div>
+
+  <div class="card">
+    <h2>Need help with what it found?</h2>
+    <p style="margin:0">Email <a href="mailto:support@themvp.in">support@themvp.in</a> or visit <a href="https://themvp.in">themvp.in</a>. We will give you a ticket number to run the check with, so our technicians can read the full report.</p>
+  </div>
 </main>
 <script>
   // Raw-file root of this repository (set once when publishing).
@@ -68,18 +75,22 @@
 
   const clean = s => s.replace(/[^A-Za-z0-9]/g, "");
   const COMMANDS = {
-    windows: t => `powershell -NoProfile -ExecutionPolicy Bypass -c "& ([scriptblock]::Create((irm ${RAW}/windows/run.ps1)))${t ? " -Ticket " + t : ""}"`,
-    linux: t => `u=${RAW}/linux/themvp-diag.sh; f=$(mktemp); (curl -fsSL $u || wget -qO- $u) > $f && sudo bash $f ${t || "NOTICKET"}; rm -f $f`
+    windows: t => `powershell -NoProfile -ExecutionPolicy Bypass -c "& ([scriptblock]::Create((irm ${RAW}/windows/run.ps1))) ${t ? "-Ticket " + t : "-NoTicket"}"`,
+    linux: t => `u=${RAW}/linux/themvp-diag.sh; f=$(mktemp); (curl -fsSL $u || wget -qO- $u) > $f && sudo bash $f${t ? " " + t : ""}; rm -f $f`
   };
   const WHERE = {
     windows: "Press the Windows key, type cmd, press Enter. Paste the command (right-click) and press Enter.",
     linux: "Open a Terminal (Ctrl+Alt+T on Ubuntu). Paste the command (Ctrl+Shift+V) and press Enter."
   };
   const STEPS = {
-    windows: ["Click Yes when Windows asks for permission.", "Wait about 1 minute and do not use the PC meanwhile.",
-              "A file named themvp-diag-….zip appears on your Desktop. Send us that file by replying to your ticket email."],
-    linux: ["Type your password when asked (it is not shown while typing).", "Wait about 4 minutes and do not use the PC meanwhile.",
-            "Send us the themvp-diag-….tar.gz file from your home folder by replying to your ticket email."]
+    windows: ["Click Yes when Windows asks for permission.", "Wait about 1 minute and do not use the PC meanwhile."],
+    linux: ["Type your password when asked (it is not shown while typing).", "Wait about 4 minutes and do not use the PC meanwhile."]
+  };
+  const LAST = {   // [with ticket, without ticket]
+    windows: ["A file named themvp-diag-….zip appears on your Desktop. Send us that file by replying to your ticket email.",
+              "Your results open in your web browser. A copy is kept in a TheMVP-diag-… folder on your Desktop."],
+    linux: ["Send us the themvp-diag-….tar.gz file from your home folder by replying to your ticket email.",
+            "Your results are shown in the Terminal. A copy is saved as themvp-diag-….tar.gz in your home folder."]
   };
 
   function detect() {
@@ -90,9 +101,11 @@
 
   function render() {
     tabs.forEach(b => b.setAttribute("aria-pressed", b.dataset.os === os));
-    document.getElementById("cmd").textContent = COMMANDS[os](clean(ticketBox.value.trim()));
+    const t = clean(ticketBox.value.trim());
+    document.getElementById("cmd").textContent = COMMANDS[os](t);
     document.getElementById("where").textContent = WHERE[os];
-    document.getElementById("steps").replaceChildren(...STEPS[os].map(s => Object.assign(document.createElement("li"), { textContent: s })));
+    const steps = [...STEPS[os], LAST[os][t ? 0 : 1]];
+    document.getElementById("steps").replaceChildren(...steps.map(s => Object.assign(document.createElement("li"), { textContent: s })));
   }
   tabs.forEach(b => b.addEventListener("click", () => { os = b.dataset.os; render(); }));
   ticketBox.addEventListener("input", render);

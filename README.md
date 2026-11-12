@@ -1,14 +1,43 @@
 # TheMVP PC Health Check
 
-A read-only check that first lists your PC's parts (processor, graphics card, memory,
-drives, motherboard), then collects what your PC has already recorded (crashes, sudden
-shutdowns, hardware errors, drive health, temperatures, drivers) into a report you
-send to TheMVP support.
+A free, read-only check for any Windows or Linux PC. It first lists your PC's parts
+(processor, graphics card, memory, drives, motherboard), then reads what your PC has
+already recorded (crashes, sudden shutdowns, hardware errors, drive health, temperatures,
+drivers) and shows you a plain-English summary.
 
 **Easiest:** open **https://mvp-support.github.io/pc-health-check/**. It recognises your
 system and shows the right command with a Copy button.
 
-## Windows 10 / 11
+## Check your own PC (no ticket needed)
+
+Nothing is sent anywhere; the results are shown on your screen.
+
+**Windows 10 / 11:** press the Windows key, type `cmd`, press Enter, then paste:
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -c "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/mvp-support/pc-health-check/main/windows/run.ps1))) -NoTicket"
+```
+
+Click **Yes** when Windows asks for permission. After about a minute your results open in
+your web browser, and a copy is kept in a `TheMVP-diag-…` folder on your Desktop.
+
+**Linux (Ubuntu, Debian, Fedora):** open a Terminal and paste:
+
+```
+u=https://raw.githubusercontent.com/mvp-support/pc-health-check/main/linux/themvp-diag.sh; f=$(mktemp); (curl -fsSL $u || wget -qO- $u) > $f && sudo bash $f; rm -f $f
+```
+
+After about 4 minutes the results are shown in the Terminal, and a copy is saved as
+`~/themvp-diag-NOTICKET-<host>-<time>.tar.gz`.
+
+Need help with what it found? Email support@themvp.in or visit https://themvp.in. We will
+give you a ticket number to run the check with (below), so our technicians can read the full report.
+
+## TheMVP customers with a ticket number
+
+Use these when TheMVP Support asks you to. Replace `SID000616` with your ticket number.
+
+### Windows 10 / 11
 
 Press the Windows key, type `cmd`, press Enter, then paste:
 
@@ -22,7 +51,7 @@ Windows asks for permission. After about a minute, a plain-English summary opens
 one file by replying to your ticket email. (The `TheMVP-diag-…` folder next to it holds the
 same files unzipped.)
 
-## Linux (Ubuntu, Debian, Fedora)
+### Linux (Ubuntu, Debian, Fedora)
 
 Open a Terminal and paste:
 
@@ -32,7 +61,7 @@ u=https://raw.githubusercontent.com/mvp-support/pc-health-check/main/linux/themv
 
 After about 4 minutes it writes `~/themvp-diag-<ticket>-<host>-<time>.tar.gz`. Send us that file
 by replying to your ticket email.
-Optional load test: add `--stress 15 --gpu-stress 15` after the ticket number.
+Optional load test: add `--stress 15 --gpu-stress 15` at the end (works with or without a ticket number).
 
 To check the script before running it, compare its SHA256 with `linux/themvp-diag.sh.sha256`:
 

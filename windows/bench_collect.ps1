@@ -536,6 +536,7 @@ td{border-top:1px solid #ddd;padding:8px;vertical-align:top}.ok{color:#11722e;wh
 <b>What it did NOT do</b>: it did not open your documents, photos, e-mails or browser history, did not read
 passwords, and did not install, change or delete anything. $(if ($Server) { "The results went only to TheMVP's service desk." } else { "Nothing was sent anywhere." })</div>
 <h2>Results</h2><table>$rows</table>
+<div class="box" style="margin-top:16px"><b>Need help with what this found?</b> Email <a href="mailto:support@themvp.in">support@themvp.in</a> or visit <a href="https://themvp.in">themvp.in</a>.</div>
 <p class="muted">TheMVP service centre. Full technical data for our technicians: $(Enc (Split-Path $file -Leaf))</p>
 </body></html>
 "@

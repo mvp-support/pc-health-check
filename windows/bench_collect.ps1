@@ -9,10 +9,13 @@
     powershell -ExecutionPolicy Bypass -File E:\bench\bench_collect.ps1
 
   Optional tools, picked up from the script's folder, an x64 subfolder, or PATH:
-    smartctl.exe   (smartmontools)        -> SMART health per drive
-    cdb.exe        (Debugging Tools)      -> faulting driver from each minidump
-  Temperatures come from LibreHardwareMonitor if it is running (it publishes
-  sensors to WMI). Without these, the rest still works.
+    smartctl.exe   (smartmontools)        -> extra SMART detail per drive (backup: Windows' own
+                                             drive counters are read without it)
+    cdb.exe        (Debugging Tools)      -> faulting driver from each minidump (without it the
+                                             dump files are copied into the report for the desk)
+  Temperatures: drives and graphics cards (NVIDIA / AMD / Intel) are read from Windows itself.
+  The processor's needs LibreHardwareMonitor running (it publishes sensors to WMI).
+  Without these, the rest still works.
 
   PC won't boot Windows? Boot WinPE (with the PowerShell component) and point
   -Windows at the installed Windows folder, e.g. -Windows D:\Windows — event logs
@@ -46,8 +49,10 @@ param(
     [int]$Trace = 0
 )
 $ErrorActionPreference = "SilentlyContinue"
-$CollectorVersion = "1.1"
+$CollectorVersion = "1.2"
 $Ticket = $Ticket -replace '[^A-Za-z0-9]', ''   # it becomes part of the zip name
+New-Item -ItemType Directory -Force -Path $Out | Out-Null
+Start-Transcript -Path (Join-Path $Out "run.log") -Force | Out-Null   # the admin window closes at the end: keep what it showed
 $since = (Get-Date).AddDays(-$Days)
 $offline = ($Windows.TrimEnd('\') -ne $env:SystemRoot.TrimEnd('\'))
 
@@ -79,20 +84,77 @@ function Gb($bytes) { if ($bytes) { [math]::Round($bytes / 1GB, 1) } else { 0 } 
 
 # Device filter, dump-header read and the Raptor Lake microcode check are adapted from
 # StressLab (c) 2025-2026 Cincy Power Computers, LLC - MIT License.
-function Get-DumpCode($path) {
-    # kernel dump header (minidumps and live kernel reports): "PAGEDU64" -> bugcheck
-    # code at 0x38, "PAGEDUMP" (32-bit) -> 0x20. Works without cdb.exe.
+function Get-DumpInfo($path) {
+    # kernel dump header (minidumps and live kernel reports): "PAGEDU64" -> bugcheck code at 0x38
+    # and its four parameters from 0x40, "PAGEDUMP" (32-bit) -> code at 0x20. Works without cdb.exe.
+    $r = @{ code = $null; params = $null }
     try {
         $fs = [IO.File]::Open($path, "Open", "Read", "ReadWrite")
-        try { $b = New-Object byte[] 64; [void]$fs.Read($b, 0, 64) } finally { $fs.Close() }
-    } catch { return $null }
+        try { $b = New-Object byte[] 96; [void]$fs.Read($b, 0, 96) } finally { $fs.Close() }
+    } catch { return $r }
     $sig = [Text.Encoding]::ASCII.GetString($b, 0, 8)
-    if ($sig -eq "PAGEDU64") { $code = [BitConverter]::ToUInt32($b, 0x38) }
+    $p = $null
+    if ($sig -eq "PAGEDU64") {
+        $code = [BitConverter]::ToUInt32($b, 0x38)
+        $p = @(0..3 | ForEach-Object { "0x{0:x}" -f [BitConverter]::ToUInt64($b, 0x40 + 8 * $_) })
+    }
     elseif ($sig -eq "PAGEDUMP") { $code = [BitConverter]::ToUInt32($b, 0x20) }
-    else { return $null }
-    if ($code -gt 0 -and $code -lt 0x100000) { return ("0x{0:x}" -f $code) }
-    return $null
+    else { return $r }
+    if ($code -gt 0 -and $code -lt 0x100000) { $r.code = "0x{0:x}" -f $code; $r.params = $p }
+    $r
 }
+
+function Get-GpuTemps {
+    # Graphics card temperature for any brand (NVIDIA, AMD, Intel): the driver reports it to Windows,
+    # the same number Task Manager shows (Windows 10 2004 and later). No extra tool needed.
+    try {
+        if (-not ("MvpGpu" -as [type])) { Add-Type -ErrorAction Stop -TypeDefinition @'
+using System; using System.Collections.Generic; using System.Runtime.InteropServices;
+public static class MvpGpu {
+    [StructLayout(LayoutKind.Sequential)] struct AdapterInfo { public uint hAdapter; public uint LuidLow; public int LuidHigh; public uint NumOfSources; public int Precise; }
+    [StructLayout(LayoutKind.Sequential)] struct EnumAdapters2 { public uint Num; public IntPtr pAdapters; }
+    [StructLayout(LayoutKind.Sequential)] struct QueryInfo { public uint hAdapter; public int Type; public IntPtr pData; public uint Size; }
+    [StructLayout(LayoutKind.Sequential)] struct PerfData { public uint PhysicalAdapterIndex; public ulong MemoryFrequency, MaxMemoryFrequency, MaxMemoryFrequencyOC, MemoryBandwidth, PCIEBandwidth; public uint FanRPM, Power, Temperature; public byte PowerStateOverride; }
+    [StructLayout(LayoutKind.Sequential)] struct CloseAdapter { public uint hAdapter; }
+    [DllImport("gdi32.dll")] static extern int D3DKMTEnumAdapters2(ref EnumAdapters2 e);
+    [DllImport("gdi32.dll")] static extern int D3DKMTQueryAdapterInfo(ref QueryInfo q);
+    [DllImport("gdi32.dll")] static extern int D3DKMTCloseAdapter(ref CloseAdapter c);
+    // one "name|tenths of a degree C|fan rpm" line per adapter that reports a temperature
+    public static List<string> Read() {
+        var r = new List<string>();
+        int sz = Marshal.SizeOf(typeof(AdapterInfo)), psz = Marshal.SizeOf(typeof(PerfData)), nsz = 2080;   // 4 x WCHAR[260]
+        IntPtr buf = Marshal.AllocHGlobal(16 * sz), name = Marshal.AllocHGlobal(nsz), pd = Marshal.AllocHGlobal(psz);
+        try {
+            var e = new EnumAdapters2 { Num = 16, pAdapters = buf };
+            if (D3DKMTEnumAdapters2(ref e) != 0) return r;
+            for (int i = 0; i < e.Num; i++) {
+                var a = (AdapterInfo)Marshal.PtrToStructure(new IntPtr(buf.ToInt64() + i * sz), typeof(AdapterInfo));
+                for (int k = 0; k < nsz; k++) Marshal.WriteByte(name, k, 0);
+                for (int k = 0; k < psz; k++) Marshal.WriteByte(pd, k, 0);
+                var q = new QueryInfo { hAdapter = a.hAdapter, Type = 8, pData = name, Size = (uint)nsz };       // adapter registry info
+                string s = D3DKMTQueryAdapterInfo(ref q) == 0 ? Marshal.PtrToStringUni(name) : "";
+                q = new QueryInfo { hAdapter = a.hAdapter, Type = 62, pData = pd, Size = (uint)psz };            // adapter perf data
+                if (D3DKMTQueryAdapterInfo(ref q) == 0) {
+                    var p = (PerfData)Marshal.PtrToStructure(pd, typeof(PerfData));
+                    if (p.Temperature > 0 && p.Temperature < 1500) r.Add(s + "|" + p.Temperature + "|" + p.FanRPM);
+                }
+                var c = new CloseAdapter { hAdapter = a.hAdapter }; D3DKMTCloseAdapter(ref c);
+            }
+        } finally { Marshal.FreeHGlobal(buf); Marshal.FreeHGlobal(name); Marshal.FreeHGlobal(pd); }
+        return r;
+    }
+}
+'@
+        }
+        @([MvpGpu]::Read() | ForEach-Object {
+            $f = $_.Split("|")
+            [ordered]@{ name = $f[0].Trim(); temp_c = [math]::Round([int]$f[1] / 10, 0); fan_rpm = [int]$f[2] }
+        })
+    } catch { @() }
+}
+# "Needs attention" line per graphics brand, kept below where the cards slow themselves down
+# (NVIDIA about 87-93 C, AMD and Intel Arc about 100 C).
+function Get-GpuLimit($name) { if ("$name" -match "nvidia|geforce|quadro|rtx|gtx") { 85 } else { 90 } }
 
 Write-Host "TheMVP bench collector - reading the last $Days days..."
 Write-Host "Read-only: it changes nothing and does not open personal files. A plain-English summary opens at the end."
@@ -156,13 +218,20 @@ $ram = [ordered]@{
 
 # --- drives ----------------------------------------------------------------------
 $disks = @(Get-PhysicalDisk | ForEach-Object {
+    $rc = $_ | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue   # built into Windows (needs admin); smartctl below adds detail when present
     [ordered]@{
-        model   = "$($_.FriendlyName)".Trim()
-        media   = "$($_.MediaType)"
-        bus     = "$($_.BusType)"
-        size_gb = Gb $_.Size
-        health  = "$($_.HealthStatus)"
-        smart   = $null
+        model          = "$($_.FriendlyName)".Trim()
+        media          = "$($_.MediaType)"
+        bus            = "$($_.BusType)"
+        size_gb        = Gb $_.Size
+        health         = "$($_.HealthStatus)"
+        firmware       = "$($_.FirmwareVersion)".Trim()
+        temp_c         = $(if ($rc.Temperature) { [int]$rc.Temperature } else { $null })   # 0 = the drive does not report it
+        wear_pct       = $rc.Wear
+        power_on_hours = $rc.PowerOnHours
+        read_errors    = $rc.ReadErrorsUncorrected    # the "total" counters are raw vendor numbers on some drives
+        write_errors   = $rc.WriteErrorsUncorrected
+        smart          = $null
     }
 })
 
@@ -279,9 +348,10 @@ if (-not $offline) {
 # --- crash dumps ---------------------------------------------------------------------
 $cdb = Find-Tool "cdb.exe"
 $dumps = @(Get-ChildItem (Join-Path $Windows "Minidump\*.dmp") | Sort-Object LastWriteTime -Descending |
-    Select-Object -First 5 | ForEach-Object {
+    Select-Object -First 10 | ForEach-Object {
+        $h = Get-DumpInfo $_.FullName
         $d = [ordered]@{ file = $_.Name; date = $_.LastWriteTime.ToString("yyyy-MM-dd HH:mm"); size_kb = [int]($_.Length / 1KB)
-                         bugcheck = (Get-DumpCode $_.FullName) }
+                         bugcheck = $h.code; params = $h.params }
         if ($cdb) {
             # Offline is fine: without symbols !analyze still names the bugcheck and
             # usually the faulting driver module.
@@ -297,8 +367,22 @@ $dumps = @(Get-ChildItem (Join-Path $Windows "Minidump\*.dmp") | Sort-Object Las
 # USB / network hangs) but saved a dump. Not crashes - kept apart from $dumps.
 $liveDumps = @(Get-ChildItem (Join-Path $Windows "LiveKernelReports") -Recurse -Filter *.dmp |
     Where-Object { $_.LastWriteTime -ge $since } | Sort-Object LastWriteTime -Descending | Select-Object -First 10 |
-    ForEach-Object { [ordered]@{ folder = $_.Directory.Name; file = $_.Name; date = $_.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
-                                 bugcheck = (Get-DumpCode $_.FullName) } })
+    ForEach-Object { $h = Get-DumpInfo $_.FullName
+                     [ordered]@{ folder = $_.Directory.Name; file = $_.Name; date = $_.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
+                                 size_kb = [int]($_.Length / 1KB); bugcheck = $h.code; params = $h.params } })
+
+# What Windows is set to save when it blue-screens. 0 = nothing: there will never be a dump to read.
+$crashControl = $null
+if (-not $offline) {
+    $cc = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
+    $fullDump = Get-Item (Join-Path $Windows "MEMORY.DMP")
+    $crashControl = [ordered]@{
+        dump_type   = $cc.CrashDumpEnabled   # 0 none, 1 complete, 2 kernel, 3 small (minidump), 7 automatic
+        auto_reboot = $cc.AutoReboot
+        # the big dump stays on the PC (gigabytes): only noted here so the desk knows it exists
+        memory_dmp  = $(if ($fullDump) { [ordered]@{ date = $fullDump.LastWriteTime.ToString("yyyy-MM-dd HH:mm"); size_mb = [int]($fullDump.Length / 1MB) } } else { $null })
+    }
+}
 
 # --- CPU microcode: 13th/14th-gen Intel instability fix ----------------------------------
 $cpuReg = Get-ItemProperty "HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0"
@@ -344,18 +428,20 @@ $deviceErrors = @(Get-CimInstance Win32_PnPEntity |
     Where-Object { $_.ConfigManagerErrorCode -notin 0, 22, 24, 45 -and "$($_.Name)" -notmatch $benignDev } |
     ForEach-Object { [ordered]@{ name = "$($_.Name)"; code = $_.ConfigManagerErrorCode } })
 
-# --- temperatures (LibreHardwareMonitor running) -----------------------------------------
+# --- temperatures: graphics from Windows itself, processor from LibreHardwareMonitor if running ---
 $temps = $null
 $sensors = @(Get-CimInstance -Namespace "root/LibreHardwareMonitor" -ClassName Sensor |
     Where-Object { $_.SensorType -eq "Temperature" })
-if ($sensors.Count) {
-    $cpuT = $sensors | Where-Object { $_.Identifier -match "cpu" } | Measure-Object Max -Maximum
-    $gpuT = $sensors | Where-Object { $_.Identifier -match "gpu" } | Measure-Object Max -Maximum
-    $temps = [ordered]@{ cpu_max_c = $cpuT.Maximum; gpu_max_c = $gpuT.Maximum }
-}
+$cpuT = ($sensors | Where-Object { $_.Identifier -match "cpu" } | Measure-Object Max -Maximum).Maximum
+$gpuT = ($sensors | Where-Object { $_.Identifier -match "gpu" } | Measure-Object Max -Maximum).Maximum
+$gpuTemps = @(if (-not $offline) { Get-GpuTemps })
+if (-not $gpuTemps.Count -and $gpuT) { $gpuTemps = @([ordered]@{ name = "Graphics"; temp_c = [math]::Round($gpuT, 0); fan_rpm = $null }) }
+if (-not $gpuT -and $gpuTemps.Count) { $gpuT = ($gpuTemps | ForEach-Object { $_.temp_c } | Measure-Object -Maximum).Maximum }
+if ($cpuT -or $gpuT) { $temps = [ordered]@{ cpu_max_c = $cpuT; gpu_max_c = $gpuT; gpus = $gpuTemps } }
+# Windows has no dependable built-in processor temperature reading: say how to get one
+$tempNote = $(if (-not $cpuT -and -not $offline) { "Processor temperature is not included: Windows cannot read it by itself. To add it, install LibreHardwareMonitor (free, github.com/LibreHardwareMonitor/LibreHardwareMonitor), leave it open and run this check again. HWiNFO (hwinfo.com) also shows every temperature on screen." })
 
 # --- live performance sample (+ optional WPR trace) --------------------------------------
-New-Item -ItemType Directory -Force -Path $Out | Out-Null
 $stamp = "{0}-{1}" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd-HHmm")
 $traceFile = $null
 if ($Trace -gt 0 -and -not $isAdmin) { Write-Host "Skipping -Trace: Windows Performance Recorder needs an Admin terminal." -ForegroundColor Yellow }
@@ -412,6 +498,9 @@ function Add-Check($area, $ok, $good, $bad) {
 $codes = @(@($bugchecks) + @($dumps | ForEach-Object { $_.bugcheck }) | Where-Object { $_ } | Select-Object -Unique)   # event log + dump files
 Add-Check "Blue-screen crashes" (-not $codes.Count) "No blue-screen crashes recorded in the last $Days days." `
     ("Windows crashed with a blue screen (error code: {0}). The saved crash files help us find the cause." -f ($codes -join ", "))
+if ($crashControl -and $crashControl.dump_type -eq 0) {
+    Add-Check "Crash recording" $false "" "Windows is set to save nothing when it blue-screens, so a crash leaves no file to examine. Turn on 'Automatic memory dump' under System > Advanced system settings > Startup and Recovery."
+}
 $lost = [math]::Max(0, $events.kp41_no_bugcheck - $events.kp41_power_button)
 Add-Check "Sudden power loss" (-not $lost) "No sudden power cuts recorded." `
     "The PC switched off suddenly $lost time(s) without shutting down - usually the power supply, a power cable or the wall socket."
@@ -425,10 +514,17 @@ Add-Check "Hardware error reports" (-not $fatal -and $wheaN -lt 10) `
     $(if ($fatal) { "The processor, memory or an expansion card reported $fatal serious hardware error(s)." } else { "$wheaN hardware warnings - corrected, but this many points to a part starting to fail." })
 foreach ($d in $disks) {
     $s = $d.smart
-    $badSectors = $(if ($s) { [int64]$s.reallocated + [int64]$s.pending + [int64]$s.media_errors } else { 0 })
-    $ok = ($d.health -in "", "Healthy") -and -not ($s -and ($s.passed -eq $false -or $badSectors))
-    $wear = $(if ($s -and $s.percent_used -ne $null) { " ($($s.percent_used)% of its rated life used)" } else { "" })
-    Add-Check "Drive: $($d.model)" $ok "Healthy$wear." "Showing errors or wear ($badSectors bad sectors / errors). Your data may be at risk - back it up."
+    # Windows' own counters first, smartctl (when it is there) on top
+    $badSectors = [int64]$d.read_errors + [int64]$d.write_errors + $(if ($s) { [int64]$s.reallocated + [int64]$s.pending + [int64]$s.media_errors } else { 0 })
+    $used = $(if ($s -and $s.percent_used -ne $null) { $s.percent_used } else { $d.wear_pct })
+    $t = $(if ($d.temp_c) { $d.temp_c } elseif ($s) { $s.temp_c })
+    $limit = $(if ($d.media -eq "HDD") { 55 } else { 70 })   # recommended ceilings: hard disks 55 C, SSD / NVMe 70 C
+    $faulty = ($d.health -notin "", "Healthy") -or ($s -and $s.passed -eq $false) -or $badSectors
+    $detail = @($(if ($used -ne $null) { "$used% of its rated life used" }), $(if ($t) { "$t C, recommended below $limit C" })) | Where-Object { $_ }
+    $detail = $(if ($detail) { " (" + ($detail -join "; ") + ")" } else { "" })
+    Add-Check "Drive: $($d.model)" (-not $faulty -and -not ($t -gt $limit)) "Healthy$detail." `
+        $(if ($faulty) { "Showing errors or wear ($badSectors bad sectors / errors)$detail. Your data may be at risk - back it up." }
+          else { "Running hot$detail. Check the airflow over the drive or its heatsink." })
 }
 if ($events.disk + $events.ntfs) {
     Add-Check "Drive errors in the log" $false "" "Windows logged $($events.disk + $events.ntfs) error(s) while reading or writing the drive."
@@ -444,9 +540,15 @@ $gpuHangs = [math]::Max([int]$events.display_tdr, @($liveDumps | Where-Object { 
 Add-Check "Graphics driver" (-not $gpuHangs) "The graphics driver ran without resets." `
     "The graphics driver stopped responding and had to restart $gpuHangs time(s)."
 if ($temps) {
-    Add-Check "Temperatures" (-not ($temps.cpu_max_c -gt 90 -or $temps.gpu_max_c -gt 85)) `
-        "Processor $($temps.cpu_max_c) C, graphics $($temps.gpu_max_c) C - normal." `
-        "Running hot: processor $($temps.cpu_max_c) C, graphics $($temps.gpu_max_c) C. Cooling needs attention."
+    $hot = $temps.cpu_max_c -gt 90
+    $read = @()
+    if ($temps.cpu_max_c) { $read += "processor $([int]$temps.cpu_max_c) C (recommended below 90 C)" }
+    foreach ($g in $temps.gpus) {
+        $lim = Get-GpuLimit $g.name
+        $read += "$($g.name) $($g.temp_c) C (recommended below $lim C)"
+        if ($g.temp_c -gt $lim) { $hot = $true }
+    }
+    Add-Check "Temperatures" (-not $hot) ("Normal: " + ($read -join "; ") + ".") ("Running hot: " + ($read -join "; ") + ". Cooling needs attention.")
 }
 if ($null -ne $cpuFirmware.vmin_fix) {
     Add-Check "Processor firmware" $cpuFirmware.vmin_fix `
@@ -495,10 +597,12 @@ $report = [ordered]@{
     bugchecks     = @($bugchecks | Select-Object -Unique)
     dumps         = $dumps
     live_dumps    = $liveDumps
+    crash_control = $crashControl
     cpu_firmware  = $cpuFirmware
     security      = $security
     device_errors = $deviceErrors
     temps         = $temps
+    temp_note     = $tempNote
     boot          = $boot
     settings      = $settings
     perf          = $perf
@@ -530,12 +634,19 @@ td{border-top:1px solid #ddd;padding:8px;vertical-align:top}.ok{color:#11722e;wh
 <h2>Your PC</h2><table>$specs</table>
 <div class="box" style="margin-top:16px"><b>What this check did</b> - it only <b>read</b> information Windows already keeps about itself:
 <ul><li>Windows' own logs of crashes, power cuts, freezes and hardware errors</li>
-<li>Drive health reports and free space</li><li>The parts list, driver and processor firmware versions, and devices with errors</li>
+<li>Drive health reports, drive and graphics card temperatures, and free space</li><li>The parts list, driver and processor firmware versions, and devices with errors</li>
 <li>Whether Windows is activated and the TPM security chip and Secure Boot are on</li>
 <li>Start-up time and, for $PerfSeconds seconds, how busy the PC was (program names only)</li></ul>
+<b>What the report folder contains besides this page</b> (the <code>raw</code> folder, for our technicians):
+<ul><li>Every error and warning from Windows' System and Application logs for the last $Days days. These lines can
+name programs and file locations, including your Windows user name (for example C:\Users\your-name\...).</li>
+<li>The crash files Windows saved after a blue screen (up to 10 small "minidump" files). Each holds a small
+snapshot of system memory from the moment of the crash.</li>
+<li>This PC's name, and a log of what this check printed while it ran.</li></ul>
 <b>What it did NOT do</b>: it did not open your documents, photos, e-mails or browser history, did not read
-passwords, and did not install, change or delete anything. $(if ($Server) { "The results went only to TheMVP's service desk." } else { "Nothing was sent anywhere." })</div>
+passwords, and did not install, change or delete anything. $(if ($Server) { "The results went only to TheMVP's service desk." } else { "Nothing was sent anywhere. You decide whether to send the report." })</div>
 <h2>Results</h2><table>$rows</table>
+$(if ($tempNote) { "<p class=`"muted`">$(Enc $tempNote)</p>" })
 <div class="box" style="margin-top:16px"><b>Need help with what this found?</b> Email <a href="mailto:support@themvp.in">support@themvp.in</a> or visit <a href="https://themvp.in">themvp.in</a>.</div>
 <p class="muted">TheMVP service centre. Full technical data for our technicians: $(Enc (Split-Path $file -Leaf))</p>
 </body></html>
@@ -549,6 +660,7 @@ Write-Host ("Kernel-Power 41: {0} (no bugcheck: {1}) | WHEA: {2} | disk errors: 
 if ($boot.last_ms) { Write-Host ("Last boot: {0:N1} s | slowed by: {1}" -f ($boot.last_ms / 1000), (($culprits | ForEach-Object { $_.name }) -join ", ")) }
 if ($perf) { Write-Host ("Idle CPU {0}% | DPC {1}% | interrupts {2}% | disk busy {3}% | free RAM {4} MB" -f `
     $perf.cpu_pct, $perf.dpc_pct, $perf.interrupt_pct, $perf.disk_busy_pct, $perf.avail_mem_mb) }
+if ($tempNote) { Write-Host $tempNote -ForegroundColor Yellow }
 
 # --- raw evidence + one zip to send ------------------------------------------------------
 # The service desk recounts every figure above from these raw event lines instead of
@@ -571,9 +683,26 @@ $counted = @(@($kp41) + @($wer1001) + @($wheaEv) + @($ev6008) + @($diskEv) + @($
 $sysLines = @("# System events counted in the report, last $Days days (time | level | source | event id | message)") +
     @($counted | ForEach-Object { Format-Event $_ })
 [IO.File]::WriteAllLines((Join-Path $raw "system-events.txt"), [string[]]$sysLines, $utf8)
-$appEv = @(Get-LogEvents "Application" @{ Level = 1, 2 } | Select-Object -First 2000)
-$appLines = @("# Application errors, last $Days days, newest first (max 2000)") + @($appEv | ForEach-Object { Format-Event $_ })
-[IO.File]::WriteAllLines((Join-Path $raw "application-events.txt"), [string[]]$appLines, $utf8)
+# Every Critical / Error / Warning event, not only the ones counted above: readable text (newest
+# 3000) plus the original .evtx, which opens in Event Viewer with every event and all its details.
+$ms = [int64]$Days * 86400000
+foreach ($log in "System", "Application") {
+    $ev = @(Get-LogEvents $log @{ Level = 1, 2, 3 } | Select-Object -First 3000)
+    $lines = @("# $log log: critical, error and warning events, last $Days days, newest first (max 3000 - $log.evtx has them all)") +
+        @($ev | ForEach-Object { Format-Event $_ })
+    [IO.File]::WriteAllLines((Join-Path $raw "$($log.ToLower())-errors.txt"), [string[]]$lines, $utf8)
+    $evtx = Join-Path $raw "$log.evtx"
+    if ($offline) { Copy-Item (Join-Path $Windows "System32\winevt\Logs\$log.evtx") $evtx }
+    else { wevtutil epl $log $evtx "/q:*[System[(Level=1 or Level=2 or Level=3) and TimeCreated[timediff(@SystemTime) <= $ms]]]" /ow:true | Out-Null }
+}
+# The crash dump files themselves: the service desk opens them in WinDbg to name the faulting
+# driver (cdb.exe is not on a customer's PC). Small ones only - the report has to fit in an e-mail.
+$dumpDir = Join-Path $raw "dumps"
+New-Item -ItemType Directory -Force -Path $dumpDir | Out-Null
+@(Get-ChildItem (Join-Path $Windows "Minidump\*.dmp") | Sort-Object LastWriteTime -Descending | Select-Object -First 10) +
+    @(Get-ChildItem (Join-Path $Windows "LiveKernelReports") -Recurse -Filter *.dmp | Where-Object { $_.LastWriteTime -ge $since } |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 3) |
+    Where-Object { $_ -and $_.Length -le 10MB } | Copy-Item -Destination $dumpDir
 $bcLines = @("# Blue-screen codes: Kernel-Power 41 / WER 1001 events, then crash dump files") +
     @(@($kp41 | Where-Object { [int64]$_.Properties[0].Value -ne 0 }) + @($wer1001) | Where-Object { $_ } | ForEach-Object { Format-Event $_ }) +
     @(@($dumps) + @($liveDumps) | Where-Object { $_ } | ForEach-Object { ($_ | ConvertTo-Json -Compress -Depth 3) })
@@ -585,6 +714,12 @@ if (-not $offline) {
 } else { $drvLines += "(not available when run from WinPE)" }
 [IO.File]::WriteAllLines((Join-Path $raw "drivers.txt"), [string[]]$drvLines, $utf8)
 [IO.File]::WriteAllText((Join-Path $raw "disks.txt"), (@{ disks = $disks; volumes = $volumes } | ConvertTo-Json -Depth 6), $utf8)
+# Every command that failed while collecting (failures are silenced so one broken part cannot stop the
+# rest): tells the desk when a section is empty because of an error, not because nothing happened.
+[IO.File]::WriteAllLines((Join-Path $raw "collector-errors.txt"),
+    [string[]]@($Error | Where-Object { "$_" -notmatch "No events were found" } |   # an empty search is not a failure
+        ForEach-Object { "line {0}: {1}" -f $_.InvocationInfo.ScriptLineNumber, "$_" }), $utf8)
+Stop-Transcript | Out-Null   # before zipping: run.log goes in the zip and must not be locked
 
 $zip = $null
 if ($Ticket) {

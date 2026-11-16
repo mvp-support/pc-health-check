@@ -14,7 +14,13 @@ while (-not $Ticket -and -not $NoTicket) {
 }
 $ps1 = Join-Path $env:TEMP "themvp-bench_collect.ps1"
 Write-Host "Downloading the TheMVP health check from $Base ..."
-Invoke-WebRequest "$Base/windows/bench_collect.ps1" -OutFile $ps1 -UseBasicParsing
+try { Invoke-WebRequest "$Base/windows/bench_collect.ps1" -OutFile $ps1 -UseBasicParsing }
+catch {
+    Write-Host "Could not download the health check. Please make sure this PC is connected to the internet, then paste the command again." -ForegroundColor Yellow
+    Write-Host "If it still fails, an antivirus or an office network may be blocking github.com. Please send TheMVP a screenshot of this window."
+    Write-Host "(Technical detail: $($_.Exception.Message))"
+    return
+}
 
 $name = "TheMVP-diag-" + $(if ($Ticket) { "$Ticket-" } else { "" }) + (Get-Date -Format "yyyyMMdd-HHmm")
 $desktop = [Environment]::GetFolderPath("Desktop")
@@ -53,4 +59,5 @@ if (-not $Ticket -and (Get-ChildItem $out -Filter *.json -ErrorAction SilentlyCo
     Start-Process explorer $out
 } else {
     Write-Host "The check did not finish. Please send TheMVP a screenshot of this window."
+    if (Test-Path (Join-Path $out "run.log")) { Write-Host "Please also send the file run.log from this folder: $out" }
 }

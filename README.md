@@ -71,14 +71,50 @@ curl -fsSL https://raw.githubusercontent.com/mvp-support/pc-health-check/main/li
 
 After any change to the script, update the checksum: `cd linux && sha256sum themvp-diag.sh > themvp-diag.sh.sha256`.
 
+## Temperatures
+
+- **Drives and graphics cards on Windows (NVIDIA, AMD, Intel):** read from Windows itself,
+  nothing to install. Recommended: SSD and NVMe drives below 70 °C, hard disks below 55 °C, NVIDIA graphics
+  below 85 °C, AMD and Intel graphics below 90 °C.
+- **Processor on Windows:** Windows cannot read it by itself. Install
+  [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (free),
+  leave it open and run the check again: the processor temperature is then included
+  (recommended below 90 °C). [HWiNFO](https://www.hwinfo.com) also shows every temperature
+  on screen, but the check cannot read its values.
+- **Linux:** processor and NVIDIA graphics temperatures are logged every 5 seconds.
+
+## What the report contains
+
+Everything stays on your PC unless you send it. Besides the summary, the report folder
+holds the details our technicians need, and some of them identify you or your PC:
+
+**Windows**
+- The PC's name, its parts list and driver versions.
+- Every critical, error and warning event from the System and Application logs for the
+  last 30 days, as text and as `.evtx` files. These can name programs and file locations,
+  including your Windows user name (for example `C:\Users\your-name\...`).
+- The crash files Windows saved after a blue screen: up to 10 minidumps and 3 small live
+  kernel reports. Each holds a small snapshot of system memory from the moment of the crash.
+- `run.log`: what the check printed while it ran, including your Windows user name.
+
+**Linux**
+- The PC's name, its parts list, and the serial numbers of the PC, its memory modules,
+  drives and NVIDIA graphics card.
+- The kernel log of the last 30 days and the complete system log (journal) of the previous
+  start-up, up to 20,000 lines. A system log can include user names, Wi-Fi network names,
+  IP addresses and commands that were run with `sudo`.
+
 ## What it does not do
 
 - It does not open personal files, photos, browser history or passwords.
 - It does not upload anything. You decide whether to send the report.
 - Windows: it installs, changes and deletes nothing. The script it downloads is removed again at the end.
-- Linux: if missing, it installs standard diagnostic tools (smartmontools, rasdaemon,
-  lm-sensors, pciutils, dmidecode, stress-ng) from your distribution's own repository.
-  Add `--no-install` to skip that.
+- Linux: it **does install software** if it is missing, from your distribution's own
+  repository: smartmontools, rasdaemon, lm-sensors, pciutils and dmidecode (on Fedora also
+  stress-ng). These stay installed afterwards, and rasdaemon keeps running as a small
+  background service that records hardware errors. With `--stress` it also installs
+  stress-ng; with `--gpu-stress` it downloads gpu-burn from GitHub and builds it in
+  `~/gpu-burn`. Add `--no-install` to skip all of this.
 
 ## Files
 

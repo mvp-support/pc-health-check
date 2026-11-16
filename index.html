@@ -51,13 +51,26 @@
       <li>Lists your PC's parts first: processor, graphics card, memory, drives and motherboard.</li>
       <li>Reads what your PC has already recorded: crashes, sudden shutdowns, hardware errors, drive health, temperatures and drivers.</li>
       <li>Saves a report on your PC, with a plain-English summary, for you to send to TheMVP.</li>
+      <li>Windows: drive and graphics card temperatures are included. For the processor temperature, install
+          <a href="https://github.com/LibreHardwareMonitor/LibreHardwareMonitor">LibreHardwareMonitor</a> (free), leave it open and run the check again.
+          <a href="https://www.hwinfo.com">HWiNFO</a> also shows every temperature on screen.</li>
+    </ul>
+    <h2>What the report contains</h2>
+    <p class="muted" style="margin-top:0">It stays on your PC unless you send it. Some of it identifies you or your PC:</p>
+    <ul>
+      <li>Your PC's name, parts list and driver versions. On Linux also the serial numbers of the PC, memory, drives and NVIDIA graphics card.</li>
+      <li>Windows: every error and warning from the System and Application logs of the last 30 days. They can name programs and file locations, including your Windows user name.</li>
+      <li>Windows: the crash files saved after a blue screen (up to 10 minidumps and 3 small live kernel reports). Each holds a small snapshot of system memory from the moment of the crash.</li>
+      <li>Linux: the kernel log of the last 30 days and the complete system log of the previous start-up. It can include user names, Wi-Fi network names, IP addresses and commands run with sudo.</li>
     </ul>
     <h2>What it does not do</h2>
     <ul>
       <li>It does not open your personal files, photos, browser history or passwords.</li>
       <li>It does not send anything by itself. You decide whether to send the report.</li>
-      <li>Windows: it does not install, change or delete anything.
-          Linux: it may install standard diagnostic tools (smartmontools, lm-sensors) from your distribution's own repository.</li>
+      <li>Windows: it does not install, change or delete anything.</li>
+      <li>Linux: it <b>does install software</b> if it is missing, from your distribution's own repository: smartmontools, rasdaemon, lm-sensors, pciutils and dmidecode (on Fedora also stress-ng).
+          These stay installed, and rasdaemon keeps running as a small background service that records hardware errors.
+          The optional load tests also install stress-ng and download and build gpu-burn. Add <code>--no-install</code> to the command to skip all of this.</li>
     </ul>
     <p class="muted">The full source code is public in this repository. You can read every line before running it.</p>
   </div>

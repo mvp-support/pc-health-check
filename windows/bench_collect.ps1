@@ -49,7 +49,7 @@ param(
     [int]$Trace = 0
 )
 $ErrorActionPreference = "SilentlyContinue"
-$CollectorVersion = "1.3"
+$CollectorVersion = "1.4"
 $Ticket = $Ticket -replace '[^A-Za-z0-9]', ''   # it becomes part of the zip name
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 Start-Transcript -Path (Join-Path $Out "run.log") -Force | Out-Null   # the admin window closes at the end: keep what it showed
@@ -195,11 +195,16 @@ Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11
 }
 $gpus = @(Get-CimInstance Win32_VideoController | ForEach-Object {
     $name = "$($_.Name)".Trim()
+    # PCIe lanes in use vs supported: fewer = wrong slot, riser cable or a dirty slot (live Windows only)
+    $lw = @(if (-not $offline -and $_.PNPDeviceID) { Get-PnpDeviceProperty -InstanceId $_.PNPDeviceID -KeyName DEVPKEY_PciDevice_CurrentLinkWidth, DEVPKEY_PciDevice_MaxLinkWidth -ErrorAction SilentlyContinue })
     [ordered]@{
         name           = $name
         vram_gb        = Gb $(if ($vram[$name]) { $vram[$name] } else { $_.AdapterRAM })
         driver_version = "$($_.DriverVersion)"
         driver_date    = $(if ($_.DriverDate) { $_.DriverDate.ToString("yyyy-MM-dd") } else { "" })
+        display        = [bool]$_.CurrentHorizontalResolution   # a monitor is running on this adapter
+        pcie_width     = ($lw | Where-Object { $_.KeyName -like "*Current*" }).Data
+        pcie_max_width = ($lw | Where-Object { $_.KeyName -like "*Max*" }).Data
     }
 })
 
@@ -311,6 +316,42 @@ foreach ($e in $wer1001) {
 $wheaEv = Get-SysEvents @{ ProviderName = "Microsoft-Windows-WHEA-Logger" }
 $whea = [ordered]@{}
 $wheaEv | Group-Object Id | ForEach-Object { $whea["$($_.Name)"] = $_.Count }
+# Where they came from: one PCIe device or one processor core again and again is the lead
+$pnp = @(Get-CimInstance Win32_PnPEntity)
+$pnpName = @{}
+$wheaWhere = @($wheaEv | ForEach-Object {
+    $d = Get-EventData $_
+    if ($d.PrimaryDeviceName) {
+        $b, $dv, $fn = @($d.Bus, $d.Device, $d.Function) | ForEach-Object { [Convert]::ToInt32("$_", 16) }
+        $key = "$($d.PrimaryDeviceName) $b $dv $fn"
+        if (-not $pnpName.ContainsKey($key)) {
+            # Errors are often logged by the slot's root port ("PCI Express Root Port"): name the device in that slot.
+            # Several ports share one hardware ID, so pick this one by its bus location.
+            $port = $pnp | Where-Object { $_.PNPDeviceID -like "$($d.PrimaryDeviceName)*" } | Where-Object {
+                (Get-PnpDeviceProperty -InstanceId $_.PNPDeviceID -KeyName DEVPKEY_Device_LocationInfo -ErrorAction SilentlyContinue).Data -eq "PCI bus $b, device $dv, function $fn" } | Select-Object -First 1
+            $kids = @(if ($port) { (Get-PnpDeviceProperty -InstanceId $port.PNPDeviceID -KeyName DEVPKEY_Device_Children -ErrorAction SilentlyContinue).Data })
+            $kidNames = @($kids | ForEach-Object { $k = $_; ($pnp | Where-Object { $_.PNPDeviceID -eq $k }).Name } | Where-Object { $_ })
+            $pnpName[$key] = $(if ($kidNames.Count) { "the PCIe slot of $($kidNames -join ', ')" } elseif ($port) { "PCIe device $($port.Name)" } else { "PCIe device $($d.PrimaryDeviceName)" })
+        }
+        "{0} (bus {1:x2}:{2:x2}.{3:x})" -f $pnpName[$key], $b, $dv, $fn
+    }
+    elseif ($d.ApicId) { "processor core (APIC ID $($d.ApicId))" }
+    elseif ($_.Message -match "APIC ID:\s*(\d+)") { "processor core (APIC ID $($Matches[1]))" }
+    else { "other (event $($_.Id))" }
+} | Group-Object | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object { [ordered]@{ source = $_.Name; count = $_.Count } })
+
+# Program crashes (Application Error 1000), by program and by the file they crashed in
+$crashes = @(Get-LogEvents "Application" @{ ProviderName = "Application Error"; Id = 1000 } |
+    ForEach-Object { [pscustomobject]@{ app = "$($_.Properties[0].Value)"; module = "$($_.Properties[3].Value)" } })
+# kernelbase / ucrtbase are where any program's own unhandled error ends up: not a lead
+$sharedMod = $crashes | Where-Object { $_.module -and $_.module -ne $_.app -and $_.module -notmatch "^(kernelbase|ucrtbase)\.dll$|^unknown$" } |
+    Group-Object module | Where-Object { @($_.Group.app | Sort-Object -Unique).Count -ge 3 } | Sort-Object Count -Descending | Select-Object -First 1
+$appCrashes = [ordered]@{
+    total         = $crashes.Count
+    by_program    = @($crashes | Group-Object app | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object { [ordered]@{ name = $_.Name; count = $_.Count } })
+    by_module     = @($crashes | Group-Object module | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object { [ordered]@{ name = $_.Name; count = $_.Count } })
+    shared_module = $(if ($sharedMod) { [ordered]@{ name = $sharedMod.Name; crashes = $sharedMod.Count; programs = @($sharedMod.Group.app | Sort-Object -Unique) } } else { $null })
+}
 $ev6008 = Get-SysEvents @{ ProviderName = "EventLog"; Id = 6008 }
 $diskEv = Get-SysEvents @{ ProviderName = "disk"; Id = 7, 51, 153 }
 $ntfsEv = @(Get-SysEvents @{ Id = 55 } | Where-Object { $_.ProviderName -match "Ntfs" })
@@ -324,17 +365,19 @@ $logCleared = (Get-SysEvents @{ ProviderName = "Microsoft-Windows-Eventlog"; Id 
 
 $events = [ordered]@{
     days             = $Days
-    log_start        = $(if ($logStart) { $logStart.ToString("s") })     # later than $Days ago = the log does not cover the whole window
-    log_cleared      = $(if ($logCleared) { $logCleared.ToString("s") })
+    log_start        = $(if ($logStart) { $logStart.ToString("s") } else { $null })     # later than $Days ago = the log does not cover the whole window
+    log_cleared      = $(if ($logCleared) { $logCleared.ToString("s") } else { $null })   # (an if with no else becomes {} in the JSON)
     kp41             = $kp41.Count
     kp41_no_bugcheck = @($kp41 | Where-Object { [int64]$_.Properties[0].Value -eq 0 }).Count
     kp41_power_button = @($kp41 | Where-Object { (Get-EventData $_).LongPowerButtonPressDetected -eq "true" }).Count   # held power button = it froze, not a power loss
     unexpected_6008  = $ev6008.Count
     whea             = $whea
+    whea_where       = $wheaWhere
     disk             = $diskEv.Count
     ntfs             = $ntfsEv.Count
     display_tdr      = $tdrEv.Count
     cpu_throttle_37  = $thr37.Count
+    app_crashes      = $appCrashes
 }
 
 # --- boot performance: Windows times every boot and names what slowed it ------------------
@@ -422,13 +465,13 @@ if ($u -is [byte[]] -and $u.Length -ge 4) {
 }
 $fms = $(if ("$($cpuReg.Identifier)" -match "Family (\d+) Model (\d+) Stepping (\d+)") { "$($Matches[1])/$($Matches[2])/$($Matches[3])" } else { "" })
 # Only Raptor Lake B0 silicon (CPUID 6/183/1: i5-13600K and up, i7, i9, HX) has the Vmin Shift
-# bug; non-K 13th/14th-gen i5/i3 are Alder Lake dies and must not be compared to 0x12B.
+# bug; non-K 13th/14th-gen i5/i3 are Alder Lake dies and must not be compared to 0x12F.
 $raptorB0 = ($cpuReg.VendorIdentifier -eq "GenuineIntel") -and ($fms -eq "6/183/1")
 $cpuFirmware = [ordered]@{
     microcode = $(if ($ucode) { "0x{0:x}" -f $ucode } else { "" })
     cpuid     = $fms
     raptor_b0 = $raptorB0
-    vmin_fix  = $(if ($raptorB0 -and $ucode) { $ucode -ge 0x12B } else { $null })
+    vmin_fix  = $(if ($raptorB0 -and $ucode) { $ucode -ge 0x12F } else { $null })   # 0x12F (May 2025) is Intel's current minimum; 0x12B was the earlier one
 }
 
 # --- Windows activation, TPM, Secure Boot (live Windows only) ------------------------------
@@ -451,7 +494,7 @@ if (-not $offline) {
 # Not faults: 22 disabled on purpose, 24 not present (ghost entry), 45 not connected (unplugged USB);
 # utility drivers that sit "degraded" until their app opens them (LHM, Razer, ASUS/MSI tools).
 $benignDev = "pawnio|winring0|openhardwaremonitor|ohmkernel|rzudd|iqvw64e|asusio|asmtxhci|msio|amdpsp"
-$deviceErrors = @(Get-CimInstance Win32_PnPEntity |
+$deviceErrors = @($pnp |
     Where-Object { $_.ConfigManagerErrorCode -notin 0, 22, 24, 45 -and "$($_.Name)" -notmatch $benignDev } |
     ForEach-Object { [ordered]@{ name = "$($_.Name)"; code = $_.ConfigManagerErrorCode } })
 
@@ -541,15 +584,23 @@ Add-Check "Freezes" (-not $events.kp41_power_button) "No forced shutdowns record
     "The PC had to be forced off with the power button $($events.kp41_power_button) time(s) because it froze."
 $wheaN = [int](($whea.Values | Measure-Object -Sum).Sum)
 $fatal = [int]$whea["18"]
+$wheaFrom = $(if ($wheaWhere.Count) { " Most came from: $($wheaWhere[0].source) ($($wheaWhere[0].count))." } else { "" })
 # a few corrected errors (17/19/47) are normal; fatal 18s or a steady stream are not
 Add-Check "Hardware error reports" (-not $fatal -and $wheaN -lt 10) `
-    $(if ($wheaN) { "$wheaN minor hardware warning(s), all corrected automatically by the hardware." } else { "The processor, memory and expansion slots reported no errors." }) `
-    $(if ($fatal) { "The processor, memory or an expansion card reported $fatal serious hardware error(s)." } else { "$wheaN hardware warnings - corrected, but this many points to a part starting to fail." })
+    $(if ($wheaN) { "$wheaN minor hardware warning(s), all corrected automatically by the hardware.$wheaFrom" } else { "The processor, memory and expansion slots reported no errors." }) `
+    $(if ($fatal) { "The processor, memory or an expansion card reported $fatal serious hardware error(s).$wheaFrom" } else { "$wheaN hardware warnings - corrected, but this many points to a part starting to fail.$wheaFrom" })
+if ($appCrashes.total) {
+    $top = $appCrashes.by_program[0]
+    $sm = $appCrashes.shared_module
+    Add-Check "Program crashes" (-not $sm) `
+        ("Programs closed unexpectedly $($appCrashes.total) time(s), " + $(if ($top.count -gt 1) { "most often $($top.name) ($($top.count))" } else { "for example $($top.name)" }) + ". A program crashing in its own code points to that program, not the PC.") `
+        $(if ($sm) { "$($sm.programs.Count) different programs crashed in the same file, $($sm.name) ($($sm.crashes) crashes: $($sm.programs -join ', ')). When unrelated programs fail in the same place, the cause is usually a driver or unstable memory or processor, not the programs." })
+}
 foreach ($d in $disks) {
     $s = $d.smart
     # Windows' own counters first, smartctl (when it is there) on top
     $badSectors = [int64]$d.read_errors + [int64]$d.write_errors + $(if ($s) { [int64]$s.reallocated + [int64]$s.pending + [int64]$s.media_errors } else { 0 })
-    $used = $(if ($s -and $s.percent_used -ne $null) { $s.percent_used } else { $d.wear_pct })
+    $used = $(if ($s -and $s.percent_used -ne $null) { $s.percent_used } elseif ($d.media -ne "HDD") { $d.wear_pct })   # hard disks report 0: wear is an SSD measure
     $t = $(if ($d.temp_c) { $d.temp_c } elseif ($s) { $s.temp_c })
     $limit = $(if ($d.media -eq "HDD") { 55 } else { 70 })   # recommended ceilings: hard disks 55 C, SSD / NVMe 70 C
     $faulty = ($d.health -notin "", "Healthy") -or ($s -and $s.passed -eq $false) -or $badSectors
@@ -572,6 +623,24 @@ foreach ($v in $volumes) {
 $gpuHangs = [math]::Max([int]$events.display_tdr, @($liveDumps | Where-Object { $_.folder -eq "WATCHDOG" }).Count)
 Add-Check "Graphics driver" (-not $gpuHangs) "The graphics driver ran without resets." `
     "The graphics driver stopped responding and had to restart $gpuHangs time(s)."
+$monitorOnBoard = $null   # not checked on laptops and virtual machines
+if (-not $isLaptop -and -not $isVm) {   # laptops wire graphics at fewer lanes and to the screen by design
+    $monitorOnBoard = $false
+    foreach ($g in $gpus) {
+        if ($g.pcie_width -and $g.pcie_max_width -and $g.pcie_width -lt $g.pcie_max_width) {
+            Add-Check "Graphics card slot" $false "" "$($g.name) is connected with $($g.pcie_width) PCIe lanes but supports $($g.pcie_max_width): it is in a slower slot, on a riser cable, or the slot needs cleaning, so it runs slower than it should."
+        }
+    }
+    # a graphics card is present but the monitor runs on the motherboard's video port
+    $discrete = "nvidia|radeon (rx|pro)|arc\(tm\) [ab]\d"
+    $ignore = "basic display|remote|virtual|indirect|parsec|spacedesk|dummy"
+    $dg = @($gpus | Where-Object { $_.name -match $discrete })
+    $ig = @($gpus | Where-Object { $_.name -notmatch $discrete -and $_.name -notmatch $ignore })
+    if ($dg.Count -and -not @($dg | Where-Object { $_.display }).Count -and @($ig | Where-Object { $_.display }).Count) {
+        $monitorOnBoard = $true
+        Add-Check "Monitor connection" $false "" "The monitor is plugged into the motherboard's video port, not the graphics card ($($dg[0].name)), so games and 3D programs run on the much slower built-in graphics. Move the monitor cable to a port on the graphics card (the lower ports at the back of the PC)."
+    }
+}
 if ($temps) {
     $hot = $temps.cpu_max_c -gt 90
     $read = @()
@@ -590,7 +659,7 @@ if ($battery) {
 if ($null -ne $cpuFirmware.vmin_fix) {
     Add-Check "Processor firmware" $cpuFirmware.vmin_fix `
         "Has Intel's fix for the known 13th/14th-gen processor instability (microcode $($cpuFirmware.microcode))." `
-        "Missing Intel's fix for the known 13th/14th-gen processor instability (microcode $($cpuFirmware.microcode), fix is 0x12B or later). A BIOS update is needed to protect the processor."
+        "Missing Intel's fix for the known 13th/14th-gen processor instability (microcode $($cpuFirmware.microcode), fix is 0x12F or later). A BIOS update is needed to protect the processor."
 }
 if ($security -and $null -ne $security.activated) {
     Add-Check "Windows activation" $security.activated "Windows is activated." "Windows is not activated."
@@ -640,6 +709,7 @@ $report = [ordered]@{
     device_errors = $deviceErrors
     temps         = $temps
     temp_note     = $tempNote
+    monitor_on_board = $monitorOnBoard
     battery       = $battery
     boot          = $boot
     settings      = $settings

@@ -110,6 +110,7 @@ holds the details our technicians need, and some of them identify you or your PC
 - The kernel log of the last 30 days and the complete system log (journal) of the previous
   start-up, up to 20,000 lines. A system log can include user names, Wi-Fi network names,
   IP addresses and commands that were run with `sudo`.
+- Any crash records the kernel saved from an earlier start-up (pstore) in the last 30 days.
 
 ## What it does not do
 

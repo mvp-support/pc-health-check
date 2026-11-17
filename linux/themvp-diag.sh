@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  TheMVP.in - Workstation Hang / Crash Diagnostic Collector  (Linux)
-#  Version: 1.4  (2026-11-16)  - INFO level (XMP on, non-persistent journal), owner wording without a ticket,
+#  Version: 1.5  (2026-11-17)  - graphics card PCIe lanes, monitor on the motherboard port, pstore crash records
+#           1.4  (2026-11-16)  - INFO level (XMP on, non-persistent journal), owner wording without a ticket,
 #                                laptop battery wear, virtual machines skip sensor warnings
 #           1.3  (2026-11-12)  - ticket ID optional: without it the report is for the owner's own use
 #           1.2  (2026-11-06)  - ticket ID required in the file name, full previous-boot log
@@ -19,7 +20,7 @@
 #  smartmontools / rasdaemon / lm-sensors / stress-ng / gpu-burn (skip with --no-install).
 # =============================================================================
 
-VERSION="1.4"
+VERSION="1.5"
 TICKET=NOTICKET; case "${1:-}" in ""|-*) ;; *) TICKET="$1"; shift ;; esac   # no ticket: own-use run, options may come first
 TICKET="$(printf '%s' "$TICKET" | tr -cd 'A-Za-z0-9')"; [ -n "$TICKET" ] || TICKET=NOTICKET   # it becomes part of the file name
 STRESS_MIN=0; GPU_STRESS_MIN=0; DAYS=30; INSTALL=1
@@ -318,6 +319,14 @@ fi
 [ "$PANIC_N" -gt 0 ] && flag RED LOCKUP "$PANIC_N kernel panic / lockup / hung-task lines - see raw/lockups.txt."
 [ "$EDAC_N" -gt 0 ] && flag RED EDAC "$EDAC_N EDAC memory error lines."
 
+# pstore: crash records the kernel saved in firmware memory, kept across the restart (systemd-pstore moves them
+# to /var/lib/systemd/pstore). Often the only trace of a crash that never reached the system log.
+for p in /sys/fs/pstore /var/lib/systemd/pstore; do
+  [ -d "$p" ] && mkdir -p "$RAW/pstore" && find "$p" -type f -name 'dmesg*' -mtime -"$DAYS" -size -2M -exec cp --parents {} "$RAW/pstore/" \; 2>/dev/null
+done
+PSTORE_N=$(find "$RAW/pstore" -type f 2>/dev/null | grep -c .)
+[ "$PSTORE_N" -gt 0 ] && flag RED PSTORE "Kernel crash records from an earlier start-up (pstore, $PSTORE_N file(s), see raw/pstore) - a crash that never reached the system log."
+
 if have ras-mc-ctl; then
   run ras.txt ras-mc-ctl --summary
   run ras.txt ras-mc-ctl --errors
@@ -365,6 +374,30 @@ if have nvidia-smi; then
 fi
 have lspci && run pci.txt lspci -nnk
 have lspci && run pci.txt lspci -vv
+if [ "$LAPTOP" -eq 0 ] && [ -z "$VIRT" ]; then   # laptops wire graphics at fewer lanes and to the screen by design
+  NV_PRESENT=0
+  for d in /sys/bus/pci/devices/*; do
+    case "$(cat "$d/class" 2>/dev/null)" in 0x0300*|0x0302*) ;; *) continue ;; esac
+    [ "$(cat "$d/vendor" 2>/dev/null)" = 0x10de ] && NV_PRESENT=1
+    # PCIe lanes in use vs supported: fewer = wrong slot, riser cable or a dirty slot.
+    # shortcut: AMD RX 6000/7000 report the link to their own internal switch (always full), so a short link there goes unseen.
+    cw=$(cat "$d/current_link_width" 2>/dev/null); mw=$(cat "$d/max_link_width" 2>/dev/null)
+    case "$cw$mw" in ""|*[!0-9]*) continue ;; esac
+    if [ "$cw" -gt 0 ] && [ "$cw" -lt "$mw" ]; then
+      GNAME=$(lspci -s "${d##*/}" 2>/dev/null | cut -d: -f3- | sed 's/^ *//'); GNAME="${GNAME:-${d##*/}}"
+      flag AMBER PCIE_WIDTH "Graphics card $GNAME is connected with $cw PCIe lanes but supports $mw - slower slot, riser cable or a dirty slot."
+    fi
+  done
+  # NVIDIA card fitted, but the monitor is on the motherboard's port (Intel / AMD built-in graphics)
+  if [ "$NV_PRESENT" -eq 1 ]; then
+    for c in /sys/class/drm/card*-*; do
+      [ "$(cat "$c/status" 2>/dev/null)" = connected ] || continue
+      case "$(cat "/sys/class/drm/$(basename "$c" | cut -d- -f1)/device/vendor" 2>/dev/null)" in
+        0x8086|0x1002) flag AMBER MONITOR_ON_BOARD "Monitor is plugged into the motherboard's video port (${c##*/}), not the NVIDIA graphics card - games and 3D programs run on the slow built-in graphics. Move the cable to the graphics card."; break ;;
+      esac
+    done
+  fi
+fi
 
 # ---------------------------------------------------------------- 7. Sensors / power
 step "Sensors"
@@ -538,7 +571,7 @@ echo " GPU          : $GPU_SUMMARY"
 echo " Disks        :"; [ -f "$OUT/.disks" ] && sed 's/^/   - /' "$OUT/.disks"
 echo " Journal      : persistent=$JPERSIST, window=${DAYS}d, boots logged=$(grep -c . "$RAW/boots.txt" 2>/dev/null)"
 echo "--------------------------------------------------------------"
-echo " Kernel counts: MCE=$MCE_N segfault=$SEGV_N GPF=$GPF_N GPU_Xid=$XID_N AER=$AER_N NVMe_err=$NVME_ERR_N OOM=$OOM_N lockup/panic=$PANIC_N EDAC=$EDAC_N"
+echo " Kernel counts: MCE=$MCE_N segfault=$SEGV_N GPF=$GPF_N GPU_Xid=$XID_N AER=$AER_N NVMe_err=$NVME_ERR_N OOM=$OOM_N lockup/panic=$PANIC_N EDAC=$EDAC_N pstore=$PSTORE_N"
 if [ "$SEGV_N" -gt 0 ]; then
   echo " Segfault core map (count, physical core, logical cpu):"; sed 's/^/   /' "$RAW/segfault_core_map.txt"
   echo " Crashing programs: $SEGV_PROGS"
@@ -560,7 +593,7 @@ echo "  \"collector_version\": \"$VERSION\", \"ticket\": \"$TICKET\", \"host\": 
 echo "  \"verdict\": \"$(echo "$VERDICT" | cut -d' ' -f1)\", \"likely_cause\": \"$(echo "$CAUSE" | json_esc)\","
 echo "  \"cpu\": \"$(echo "$CPU_NAME" | json_esc)\", \"microcode\": \"$UCODE\", \"raptor_lake\": $RAPTOR,"
 echo "  \"bios\": \"$(echo "$BIOS_VER $BIOS_DATE" | json_esc)\", \"board\": \"$(echo "$BOARD" | json_esc)\", \"kernel\": \"$KERNEL\","
-echo "  \"counts\": {\"mce\": $MCE_N, \"segfault\": $SEGV_N, \"gpu_xid\": $XID_N, \"pcie_aer\": $AER_N, \"nvme_err\": $NVME_ERR_N, \"oom\": $OOM_N, \"lockup\": $PANIC_N, \"edac\": $EDAC_N, \"unsafe_shutdowns\": $UNSAFE_TOTAL, \"power_cycles\": $PCYC_TOTAL},"
+echo "  \"counts\": {\"mce\": $MCE_N, \"segfault\": $SEGV_N, \"gpu_xid\": $XID_N, \"pcie_aer\": $AER_N, \"nvme_err\": $NVME_ERR_N, \"oom\": $OOM_N, \"lockup\": $PANIC_N, \"edac\": $EDAC_N, \"pstore\": $PSTORE_N, \"unsafe_shutdowns\": $UNSAFE_TOTAL, \"power_cycles\": $PCYC_TOTAL},"
 echo "  \"segfault_top_core\": \"${TOP_CORE:-}\", \"segfault_top_core_pct\": $CORE_SHARE,"
 echo "  \"virtual\": \"$VIRT\", \"laptop\": $LAPTOP, \"battery_health_pct\": \"${BATT_PCT:-}\","
 echo "  \"temps\": {\"load_test_ran\": $LOAD_RAN, \"cpu_idle_c\": \"${T_CPU_IDLE:-}\", \"cpu_load_peak_c\": \"${T_CPU_LOAD:-}\", \"cpu_load_watts_peak\": \"${W_CPU_LOAD:-}\", \"cpu_load_mhz_min\": \"${MHZ_LOAD_MIN:-}\", \"gpu_idle_c\": \"${T_GPU_IDLE:-}\", \"gpu_load_peak_c\": \"${T_GPU_LOAD:-}\", \"gpu_load_watts_peak\": \"${W_GPU_LOAD:-}\", \"gpu_thermal_slowdown_samples\": $GPU_THERM_SLOW},"

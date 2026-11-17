@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  TheMVP.in - Workstation Hang / Crash Diagnostic Collector  (Linux)
-#  Version: 1.3  (2026-11-12)  - ticket ID optional: without it the report is for the owner's own use
+#  Version: 1.4  (2026-11-16)  - INFO level (XMP on, non-persistent journal), owner wording without a ticket,
+#                                laptop battery wear, virtual machines skip sensor warnings
+#           1.3  (2026-11-12)  - ticket ID optional: without it the report is for the owner's own use
 #           1.2  (2026-11-06)  - ticket ID required in the file name, full previous-boot log
 #           1.1  (2026-10-31)  - adds idle / load / cooldown temperature logging
 #
@@ -12,12 +14,12 @@
 #                         then:  sudo themvp-diag SID000616
 #
 #  Output:  ~/themvp-diag-<TICKET>-<host>-<timestamp>.tar.gz
-#           (summary.txt with RED/AMBER/GREEN flags, summary.json, temps.csv, raw logs)
+#           (summary.txt with RED/AMBER/GREEN/INFO flags, summary.json, temps.csv, raw logs)
 #  Read-only: changes nothing on the system except optionally installing
 #  smartmontools / rasdaemon / lm-sensors / stress-ng / gpu-burn (skip with --no-install).
 # =============================================================================
 
-VERSION="1.3"
+VERSION="1.4"
 TICKET=NOTICKET; case "${1:-}" in ""|-*) ;; *) TICKET="$1"; shift ;; esac   # no ticket: own-use run, options may come first
 TICKET="$(printf '%s' "$TICKET" | tr -cd 'A-Za-z0-9')"; [ -n "$TICKET" ] || TICKET=NOTICKET   # it becomes part of the file name
 STRESS_MIN=0; GPU_STRESS_MIN=0; DAYS=30; INSTALL=1
@@ -48,7 +50,7 @@ run()  { # run <file> <cmd...>   capture output, never fail
   local f="$RAW/$1"; shift
   { echo "### $*"; timeout 120 "$@" 2>&1; } >> "$f" 2>&1 || true
 }
-flag() { # flag RED|AMBER|GREEN <code> <message>
+flag() { # flag RED|AMBER|GREEN|INFO <code> <message>   (INFO is listed but does not change the verdict)
   printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$FLAGS"
 }
 step() { printf '  [%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -113,10 +115,27 @@ RAM_GB=$(awk -F'|' '{split($2,a," "); s += (a[2]=="MB" ? a[1]/1024 : a[1])} END{
 MEM_DETAIL=""
 [ "$DIMM_COUNT" -gt 0 ] && MEM_DETAIL=" - $DIMM_COUNT stick(s): $STICKS_GB${CFG_MAX:+, running at $CFG_MAX MT/s}"
 
+# Virtual machine: it has no temperature sensors to read
+VIRT=""; have systemd-detect-virt && VIRT="$(systemd-detect-virt --vm 2>/dev/null)"; [ "$VIRT" = none ] && VIRT=""
+[ -z "$VIRT" ] && grep -qw hypervisor /proc/cpuinfo && VIRT="vm"
+# Laptop = an ACPI battery (BAT0, BAT1; mouse and UPS batteries have other names). VMs can show the host's.
+LAPTOP=0; BD=0; BN=0
+for b in /sys/class/power_supply/BAT*; do
+  [ -d "$b" ] && [ -z "$VIRT" ] || continue
+  LAPTOP=1; f=charge; [ -r "$b/energy_full_design" ] && f=energy   # mWh on most laptops, mAh (charge_*) on some
+  d=$(cat "$b/${f}_full_design" 2>/dev/null); n=$(cat "$b/${f}_full" 2>/dev/null)
+  BD=$(( BD + ${d:-0} )); BN=$(( BN + ${n:-0} ))
+done
+BATT_PCT=""; [ "$BD" -gt 0 ] && BATT_PCT=$(( BN * 100 / BD ))
+# Own-use run: where to get help (TheMVP supports desktop PCs, not laptops)
+HELP="Email support@themvp.in or visit https://themvp.in"
+[ "$LAPTOP" -eq 1 ] && HELP="TheMVP Support looks after desktop PCs, not laptops: for help with this laptop, contact its manufacturer."
+
 CONFIG="$OUT/config.txt"
 dcol() { lsblk -dno "$2" "/dev/$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }   # one column per call: empty TRAN/MODEL can't shift the rest
 {
-  echo "Computer|$SYS_MODEL"
+  echo "Computer|$SYS_MODEL${VIRT:+ (virtual machine: $VIRT)}"
+  [ -n "$BATT_PCT" ] && echo "Battery|holds $BATT_PCT% of its original charge"
   echo "Motherboard|$BOARD (BIOS $BIOS_VER, $BIOS_DATE)"
   echo "Processor|$CPU_NAME - $CPU_CORES cores / $CPU_THREADS threads${CPU_MAX_GHZ:+, up to $CPU_MAX_GHZ GHz}"
   echo "Memory|$RAM_GB GB${DDR_TYPE:+ $DDR_TYPE}$MEM_DETAIL"
@@ -227,11 +246,11 @@ step "Memory modules"
 have dmidecode && run memory.txt dmidecode -t memory
 run memory.txt free -h
 PARTS_UNIQ=$(cut -d'|' -f5 "$DIMM_TABLE" | sort -u | grep -vc '^$')
-[ "$PARTS_UNIQ" -gt 1 ] && flag AMBER RAM_MIXED "Mixed RAM part numbers installed ($(cut -d'|' -f5 "$DIMM_TABLE" | sort -u | tr '\n' ' ')) - verify against build sheet."
+MIXED_NEXT=" - verify against build sheet."; [ "$TICKET" = NOTICKET ] && MIXED_NEXT=" - mixed sticks can make a PC unstable."
+[ "$PARTS_UNIQ" -gt 1 ] && flag AMBER RAM_MIXED "Mixed RAM part numbers installed ($(cut -d'|' -f5 "$DIMM_TABLE" | sort -u | tr '\n' ' '))$MIXED_NEXT"
+XMP=0   # flagged in the summary: only a suspect when the logs or load test also show trouble
 if [ -n "$CFG_MAX" ]; then
-  if { [ "$DDR_TYPE" = "DDR5" ] && [ "$CFG_MAX" -gt 5600 ]; } || { [ "$DDR_TYPE" = "DDR4" ] && [ "$CFG_MAX" -gt 3200 ]; }; then
-    flag AMBER XMP_ON "RAM running at $CFG_MAX MT/s ($DDR_TYPE) - XMP/EXPO is ON. For stability triage set JEDEC default."
-  fi
+  if { [ "$DDR_TYPE" = "DDR5" ] && [ "$CFG_MAX" -gt 5600 ]; } || { [ "$DDR_TYPE" = "DDR4" ] && [ "$CFG_MAX" -gt 3200 ]; }; then XMP=1; fi
 fi
 [ "$DIMM_COUNT" -eq 4 ] && [ "$DDR_TYPE" = "DDR5" ] && flag AMBER DDR5_4DIMM "4 x DDR5 DIMMs - reduce speed (<= 5200 MT/s) or test with 2 DIMMs."
 
@@ -251,7 +270,7 @@ fi
 dmesg -T > "$RAW/dmesg_current.txt" 2>/dev/null
 # Replay mode (training / re-analysis): THEMVP_KLOG=/path/to/saved_kernel.log sudo -E bash themvp-diag.sh ...
 [ -n "${THEMVP_KLOG:-}" ] && [ -r "$THEMVP_KLOG" ] && cp "$THEMVP_KLOG" "$KLOG"
-[ "$JPERSIST" = "no" ] && flag AMBER NO_PERSIST_JOURNAL "Journal is not persistent - crash history is lost on every reboot. Run: sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald"
+[ "$JPERSIST" = "no" ] && flag INFO NO_PERSIST_JOURNAL "Journal is not persistent - only logs since the last start-up could be checked; crash history is lost on every reboot. To keep it: sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald"
 
 mce_lines "$KLOG" > "$RAW/mce_lines.txt"
 MCE_N=$(grep -c . "$RAW/mce_lines.txt")
@@ -351,6 +370,11 @@ have lspci && run pci.txt lspci -vv
 step "Sensors"
 have sensors && run sensors.txt sensors
 run power.txt cat /sys/class/power_supply/*/uevent
+if [ -n "$BATT_PCT" ]; then
+  if [ "$BATT_PCT" -lt 70 ]; then flag AMBER BATTERY_WORN "Battery holds only $BATT_PCT% of the charge it held when new (below 70%) - it runs out much sooner; the laptop's manufacturer can replace it."
+  else flag GREEN BATTERY_OK "Battery holds $BATT_PCT% of the charge it held when new."; fi
+fi
+[ -n "$VIRT" ] && flag INFO VIRTUAL_MACHINE "Virtual machine ($VIRT): temperatures and hardware sensors are not available."
 
 # ---------------------------------------------------------------- 8. Optional load tests + temperature logging
 LOAD_RAN=0
@@ -435,7 +459,7 @@ W_GPU_IDLE=$(tstat idle 8 avg);         W_GPU_LOAD=$(tstat load 8 max)
 GPU_CLK_LOAD_MIN=$(tstat load 9 min);   GPU_UTIL_LOAD=$(tstat load 10 avg)
 GPU_THERM_SLOW=$(awk -F, 'NR>1 && $2=="load" && $12=="yes"{n++} END{print n+0}' "$TEMPCSV")
 
-[ -z "$T_CPU_IDLE" ] && flag AMBER NO_CPU_SENSOR "CPU temperature sensor not readable (coretemp/k10temp) - install lm-sensors and run sensors-detect."
+[ -z "$T_CPU_IDLE" ] && [ -z "$VIRT" ] && flag AMBER NO_CPU_SENSOR "CPU temperature sensor not readable (coretemp/k10temp) - install lm-sensors and run sensors-detect."
 [ -n "$T_CPU_IDLE" ] && [ "$T_CPU_IDLE" -ge 60 ] && flag AMBER CPU_IDLE_HOT "CPU idle at ${T_CPU_IDLE}C (expected < 50C) - check cooler pump, mounting, paste, background load."
 if [ -n "$T_CPU_LOAD" ]; then
   if   [ "$T_CPU_LOAD" -ge 100 ]; then flag RED CPU_LOAD_TJMAX "CPU reached ${T_CPU_LOAD}C under load (TjMax) - throttling. Check cooler, power limits (Intel Default Settings)."
@@ -451,6 +475,13 @@ fi
 
 # ---------------------------------------------------------------- 9. Summary
 step "Writing summary"
+if [ "$XMP" -eq 1 ]; then
+  if [ $(( MCE_N + EDAC_N + GPF_N + PANIC_N )) -gt 0 ] || [ "$SEGV_N" -ge 3 ] || grep -q '|STRESS_FAIL|' "$FLAGS"; then
+    flag AMBER XMP_ON "RAM running at $CFG_MAX MT/s ($DDR_TYPE) - XMP/EXPO is ON and the logs or load test show crashes or hardware errors. For stability triage set JEDEC default."
+  else
+    flag INFO XMP_ON "RAM running at $CFG_MAX MT/s ($DDR_TYPE) - XMP/EXPO is on. Normal for this RAM; only a suspect if the PC crashes."
+  fi
+fi
 RED_N=$(grep -c '^RED|' "$FLAGS"); AMB_N=$(grep -c '^AMBER|' "$FLAGS")
 if   [ "$RED_N" -gt 0 ]; then VERDICT="RED - hardware fault evidence found"
 elif [ "$AMB_N" -gt 0 ]; then VERDICT="AMBER - warnings, needs engineer review"
@@ -464,12 +495,17 @@ elif grep -q '|GPU_XID|\|GPU_MEM|\|GPU_BURN_FAIL|' "$FLAGS"; then
   CAUSE="GPU / PCIe / GPU power. Next: Xid code lookup, reseat, PSU cables, swap GPU."
 elif grep -q '|NVME_IO|\|NVME_MEDIA|\|SMART_FAIL|' "$FLAGS"; then
   CAUSE="Storage. Next: firmware update, reseat, clone and replace drive."
-elif grep -q '|EDAC|' "$FLAGS" || grep -q '|XMP_ON|\|RAM_MIXED|' "$FLAGS"; then
+elif grep -q '|EDAC|' "$FLAGS" || grep -qE '^AMBER\|XMP_ON\||\|RAM_MIXED\|' "$FLAGS"; then
   CAUSE="Memory config/RAM. Next: JEDEC speed, one DIMM at a time, MemTest86 (UEFI)."
 elif grep -q '|CPU_LOAD_TJMAX|\|GPU_LOAD_HOT|\|CPU_IDLE_HOT|' "$FLAGS"; then
   CAUSE="Thermal / cooling. Next: check cooler pump and mount, repaste, fans and case airflow, power limits."
 elif grep -q '|OOM|' "$FLAGS"; then
   CAUSE="Workload exceeds RAM (software sizing), not a hardware fault."
+fi
+if [ "$TICKET" = NOTICKET ]; then   # own-use run: no technician steps (SOP, engineer review) on the owner's screen
+  VERDICT="${VERDICT/needs engineer review/worth a closer look}"
+  CAUSE="${CAUSE%% Next:*}"
+  [ "$RED_N$AMB_N" = 00 ] && CAUSE="Nothing found" || CAUSE="${CAUSE/Inconclusive - engineer review/No single cause stands out}"
 fi
 
 {
@@ -481,6 +517,7 @@ echo " Host         : $HOST"
 echo " Collected    : $(date '+%Y-%m-%d %H:%M:%S %Z')"
 echo " VERDICT      : $VERDICT   (RED=$RED_N  AMBER=$AMB_N)"
 echo " Likely cause : $CAUSE"
+[ "$TICKET" = NOTICKET ] && [ "$RED_N$AMB_N" != 00 ] && echo " Next step    : $HELP"
 echo "--------------------------------------------------------------"
 echo " PC CONFIGURATION"
 while IFS='|' read -r k v; do printf '   %-17s %s\n' "$k" "$v"; done < "$CONFIG"
@@ -509,7 +546,7 @@ if [ "$SEGV_N" -gt 0 ]; then
 fi
 echo "--------------------------------------------------------------"
 echo " FLAGS"
-for lvl in RED AMBER GREEN; do
+for lvl in RED AMBER GREEN INFO; do
   grep "^$lvl|" "$FLAGS" | while IFS='|' read -r L C M; do printf ' [%-5s] %-18s %s\n' "$L" "$C" "$M"; done
 done
 echo "=============================================================="
@@ -525,6 +562,7 @@ echo "  \"cpu\": \"$(echo "$CPU_NAME" | json_esc)\", \"microcode\": \"$UCODE\", 
 echo "  \"bios\": \"$(echo "$BIOS_VER $BIOS_DATE" | json_esc)\", \"board\": \"$(echo "$BOARD" | json_esc)\", \"kernel\": \"$KERNEL\","
 echo "  \"counts\": {\"mce\": $MCE_N, \"segfault\": $SEGV_N, \"gpu_xid\": $XID_N, \"pcie_aer\": $AER_N, \"nvme_err\": $NVME_ERR_N, \"oom\": $OOM_N, \"lockup\": $PANIC_N, \"edac\": $EDAC_N, \"unsafe_shutdowns\": $UNSAFE_TOTAL, \"power_cycles\": $PCYC_TOTAL},"
 echo "  \"segfault_top_core\": \"${TOP_CORE:-}\", \"segfault_top_core_pct\": $CORE_SHARE,"
+echo "  \"virtual\": \"$VIRT\", \"laptop\": $LAPTOP, \"battery_health_pct\": \"${BATT_PCT:-}\","
 echo "  \"temps\": {\"load_test_ran\": $LOAD_RAN, \"cpu_idle_c\": \"${T_CPU_IDLE:-}\", \"cpu_load_peak_c\": \"${T_CPU_LOAD:-}\", \"cpu_load_watts_peak\": \"${W_CPU_LOAD:-}\", \"cpu_load_mhz_min\": \"${MHZ_LOAD_MIN:-}\", \"gpu_idle_c\": \"${T_GPU_IDLE:-}\", \"gpu_load_peak_c\": \"${T_GPU_LOAD:-}\", \"gpu_load_watts_peak\": \"${W_GPU_LOAD:-}\", \"gpu_thermal_slowdown_samples\": $GPU_THERM_SLOW},"
 echo "  \"ram_parts\": \"$(cut -d'|' -f5 "$DIMM_TABLE" | json_esc)\","
 echo "  \"config\": ["
@@ -547,7 +585,7 @@ echo
 if [ "$TICKET" = "NOTICKET" ]; then
   echo "DONE. Your results are shown above. A copy is saved as:"
   echo "   $OUT.tar.gz"
-  echo "Need help with what it found? Email support@themvp.in or visit https://themvp.in"
+  echo "Need help with what it found? $HELP"
 else
   echo "DONE. Please email this file to support by replying to your ticket email:"
   echo "   $OUT.tar.gz"

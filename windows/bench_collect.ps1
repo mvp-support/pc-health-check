@@ -49,7 +49,7 @@ param(
     [int]$Trace = 0
 )
 $ErrorActionPreference = "SilentlyContinue"
-$CollectorVersion = "1.2"
+$CollectorVersion = "1.3"
 $Ticket = $Ticket -replace '[^A-Za-z0-9]', ''   # it becomes part of the zip name
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 Start-Transcript -Path (Join-Path $Out "run.log") -Force | Out-Null   # the admin window closes at the end: keep what it showed
@@ -167,10 +167,15 @@ $bb   = Get-CimInstance Win32_BaseBoard
 $bios = Get-CimInstance Win32_BIOS
 $os   = Get-CimInstance Win32_OperatingSystem
 $cpu  = Get-CimInstance Win32_Processor | Select-Object -First 1
+# Hyper-V guest = "Microsoft Corporation Virtual Machine", VirtualBox = "innotek GmbH VirtualBox"
+$isVm = "$($cs.Manufacturer) $($cs.Model)" -match "virtual|vmware|innotek|qemu|kvm|xen|parallels|bochs"
+$isLaptop = $cs.PCSystemType -eq 2 -and -not $isVm
 
 $computer = [ordered]@{
     manufacturer = "$($cs.Manufacturer)".Trim()
     model        = "$($cs.Model)".Trim()
+    virtual      = $isVm
+    laptop       = $isLaptop
     board        = ("$($bb.Manufacturer) $($bb.Product)").Trim()
     bios_version = "$($bios.SMBIOSBIOSVersion)".Trim()
     bios_date    = $(if ($bios.ReleaseDate) { $bios.ReleaseDate.ToString("yyyy-MM-dd") } else { "" })
@@ -235,10 +240,24 @@ $disks = @(Get-PhysicalDisk | ForEach-Object {
     }
 })
 
+# --- laptop battery: full charge today vs when new (powercfg's report needs no admin) ------
+$battery = $null
+if ($isLaptop -and -not $offline) {
+    $bx = Join-Path $env:TEMP "themvp-battery.xml"
+    powercfg /batteryreport /xml /output $bx | Out-Null
+    if (Test-Path $bx) {
+        $bats = @(([xml](Get-Content $bx -Raw)).BatteryReport.Batteries.Battery | Where-Object { $_ })
+        Remove-Item $bx   # it also holds the battery's serial number and usage history: not kept
+        $design = [int64](($bats | ForEach-Object { [int64]$_.DesignCapacity } | Measure-Object -Sum).Sum)
+        $full   = [int64](($bats | ForEach-Object { [int64]$_.FullChargeCapacity } | Measure-Object -Sum).Sum)
+        if ($design -gt 0) { $battery = [ordered]@{ design_mwh = $design; full_mwh = $full; health_pct = [int]($full * 100 / $design) } }
+    }
+}
+
 # --- PC configuration, shown first: console now, top of the customer copy later ----------
 $speeds = @($ram.modules | ForEach-Object { $_.configured_mts } | Where-Object { $_ })
 $config = @(
-    @("Computer",    "$($computer.manufacturer) $($computer.model)"),
+    @("Computer",    "$($computer.manufacturer) $($computer.model)$(if ($isVm) { ' (virtual machine)' })"),
     @("Motherboard", "$($computer.board) (BIOS $($computer.bios_version), $($computer.bios_date))"),
     @("Processor",   "$("$($cpu.Name)".Trim()) - $($cpuInfo.cores) cores / $($cpuInfo.threads) threads, $([math]::Round($cpuInfo.max_mhz / 1000, 1)) GHz base"),
     @("Memory",      ("{0} GB{1} - {2} stick(s): {3}{4}" -f $ram.total_gb, $(if ($ddr) { " DDR$ddr" } else { "" }), $ram.modules.Count,
@@ -247,6 +266,7 @@ $config = @(
 ) + @($gpus | ForEach-Object { , @("Graphics", "$($_.name)$(if ($_.vram_gb) { " - $($_.vram_gb) GB" })") }) `
   + @($disks | ForEach-Object { , @("Storage", ("{0} - {1} GB {2} {3}" -f $_.model, $_.size_gb, $_.bus, $(if ($_.media -ne "Unspecified") { $_.media })).Trim()) }) `
   + @(, @("Windows", "$($computer.os) (build $($computer.os_build))"))
+if ($battery) { $config += , @("Battery", "holds $($battery.health_pct)% of its original charge") }
 Write-Host "`nThis PC:"
 $config | ForEach-Object { Write-Host ("  {0,-12} {1}" -f $_[0], $_[1]) }
 Write-Host ""
@@ -296,9 +316,16 @@ $diskEv = Get-SysEvents @{ ProviderName = "disk"; Id = 7, 51, 153 }
 $ntfsEv = @(Get-SysEvents @{ Id = 55 } | Where-Object { $_.ProviderName -match "Ntfs" })
 $tdrEv  = Get-SysEvents @{ ProviderName = "Display"; Id = 4101 }
 $thr37  = Get-SysEvents @{ ProviderName = "Microsoft-Windows-Kernel-Processor-Power"; Id = 37 }
+# How far back the System log really goes: Windows keeps only its newest ~20 MB, and it can be cleared (event 104)
+$sysLog = $(if ($offline) { @{ Path = Join-Path $Windows "System32\winevt\Logs\System.evtx" } } else { @{ LogName = "System" } })
+$logStart = (Get-WinEvent @sysLog -MaxEvents 1 -Oldest -ErrorAction SilentlyContinue).TimeCreated
+$logCleared = (Get-SysEvents @{ ProviderName = "Microsoft-Windows-Eventlog"; Id = 104 } |
+    Where-Object { ([xml]$_.ToXml()).Event.UserData.LogFileCleared.Channel -eq "System" } | Select-Object -First 1).TimeCreated
 
 $events = [ordered]@{
     days             = $Days
+    log_start        = $(if ($logStart) { $logStart.ToString("s") })     # later than $Days ago = the log does not cover the whole window
+    log_cleared      = $(if ($logCleared) { $logCleared.ToString("s") })
     kp41             = $kp41.Count
     kp41_no_bugcheck = @($kp41 | Where-Object { [int64]$_.Properties[0].Value -eq 0 }).Count
     kp41_power_button = @($kp41 | Where-Object { (Get-EventData $_).LongPowerButtonPressDetected -eq "true" }).Count   # held power button = it froze, not a power loss
@@ -439,7 +466,8 @@ if (-not $gpuTemps.Count -and $gpuT) { $gpuTemps = @([ordered]@{ name = "Graphic
 if (-not $gpuT -and $gpuTemps.Count) { $gpuT = ($gpuTemps | ForEach-Object { $_.temp_c } | Measure-Object -Maximum).Maximum }
 if ($cpuT -or $gpuT) { $temps = [ordered]@{ cpu_max_c = $cpuT; gpu_max_c = $gpuT; gpus = $gpuTemps } }
 # Windows has no dependable built-in processor temperature reading: say how to get one
-$tempNote = $(if (-not $cpuT -and -not $offline) { "Processor temperature is not included: Windows cannot read it by itself. To add it, install LibreHardwareMonitor (free, github.com/LibreHardwareMonitor/LibreHardwareMonitor), leave it open and run this check again. HWiNFO (hwinfo.com) also shows every temperature on screen." })
+$tempNote = $(if ($isVm) { "Virtual machine: temperatures are not available, the host computer's sensors are hidden from it." }
+    elseif (-not $cpuT -and -not $offline) { "Processor temperature is not included: Windows cannot read it by itself. To add it, install LibreHardwareMonitor (free, github.com/LibreHardwareMonitor/LibreHardwareMonitor), leave it open and run this check again. HWiNFO (hwinfo.com) also shows every temperature on screen." })
 
 # --- live performance sample (+ optional WPR trace) --------------------------------------
 $stamp = "{0}-{1}" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd-HHmm")
@@ -496,8 +524,13 @@ function Add-Check($area, $ok, $good, $bad) {
     [void]$summary.Add([ordered]@{ area = $area; status = $(if ($ok) { "ok" } else { "attention" }); text = $(if ($ok) { $good } else { $bad }) })
 }
 $codes = @(@($bugchecks) + @($dumps | ForEach-Object { $_.bugcheck }) | Where-Object { $_ } | Select-Object -Unique)   # event log + dump files
-Add-Check "Blue-screen crashes" (-not $codes.Count) "No blue-screen crashes recorded in the last $Days days." `
-    ("Windows crashed with a blue screen (error code: {0}). The saved crash files help us find the cause." -f ($codes -join ", "))
+# never claim the full window when the log starts later, was cleared, or could not be read
+$covered = $(if ($logStart -and $logStart -gt $since) {
+        "since {0:dd MMM yyyy} - Windows' log does not go back further{1}" -f $logStart, $(if ($logCleared) { " (it was cleared on {0:dd MMM yyyy})" -f $logCleared })
+    } else { "in the last $Days days" })
+Add-Check "Blue-screen crashes" ($logStart -and -not $codes.Count) "No blue-screen crashes recorded $covered." `
+    $(if ($codes.Count) { "Windows crashed with a blue screen (error code: {0}). The saved crash files help us find the cause." -f ($codes -join ", ") }
+      else { "Windows' System log could not be read, so past blue screens could not be checked." })
 if ($crashControl -and $crashControl.dump_type -eq 0) {
     Add-Check "Crash recording" $false "" "Windows is set to save nothing when it blue-screens, so a crash leaves no file to examine. Turn on 'Automatic memory dump' under System > Advanced system settings > Startup and Recovery."
 }
@@ -549,6 +582,10 @@ if ($temps) {
         if ($g.temp_c -gt $lim) { $hot = $true }
     }
     Add-Check "Temperatures" (-not $hot) ("Normal: " + ($read -join "; ") + ".") ("Running hot: " + ($read -join "; ") + ". Cooling needs attention.")
+}
+if ($battery) {
+    Add-Check "Battery" ($battery.health_pct -ge 70) "Holds $($battery.health_pct)% of the charge it held when new." `
+        "Holds only $($battery.health_pct)% of the charge it held when new, so it runs out much sooner. Below 70% a new battery is worth it: the laptop's manufacturer can replace it."
 }
 if ($null -ne $cpuFirmware.vmin_fix) {
     Add-Check "Processor firmware" $cpuFirmware.vmin_fix `
@@ -603,6 +640,7 @@ $report = [ordered]@{
     device_errors = $deviceErrors
     temps         = $temps
     temp_note     = $tempNote
+    battery       = $battery
     boot          = $boot
     settings      = $settings
     perf          = $perf
@@ -634,7 +672,7 @@ td{border-top:1px solid #ddd;padding:8px;vertical-align:top}.ok{color:#11722e;wh
 <h2>Your PC</h2><table>$specs</table>
 <div class="box" style="margin-top:16px"><b>What this check did</b> - it only <b>read</b> information Windows already keeps about itself:
 <ul><li>Windows' own logs of crashes, power cuts, freezes and hardware errors</li>
-<li>Drive health reports, drive and graphics card temperatures, and free space</li><li>The parts list, driver and processor firmware versions, and devices with errors</li>
+<li>Drive health reports, drive and graphics card temperatures, free space$(if ($battery) { ", and battery wear" })</li><li>The parts list, driver and processor firmware versions, and devices with errors</li>
 <li>Whether Windows is activated and the TPM security chip and Secure Boot are on</li>
 <li>Start-up time and, for $PerfSeconds seconds, how busy the PC was (program names only)</li></ul>
 <b>What the report folder contains besides this page</b> (the <code>raw</code> folder, for our technicians):
@@ -647,7 +685,8 @@ snapshot of system memory from the moment of the crash.</li>
 passwords, and did not install, change or delete anything. $(if ($Server) { "The results went only to TheMVP's service desk." } else { "Nothing was sent anywhere. You decide whether to send the report." })</div>
 <h2>Results</h2><table>$rows</table>
 $(if ($tempNote) { "<p class=`"muted`">$(Enc $tempNote)</p>" })
-<div class="box" style="margin-top:16px"><b>Need help with what this found?</b> Email <a href="mailto:support@themvp.in">support@themvp.in</a> or visit <a href="https://themvp.in">themvp.in</a>.</div>
+<div class="box" style="margin-top:16px">$(if ($isLaptop -and -not $Ticket) { "<b>Need help with this laptop?</b> TheMVP Support looks after desktop PCs, not laptops. Please contact $(Enc $computer.manufacturer) support or use the warranty that came with the laptop." }
+  else { '<b>Need help with what this found?</b> Email <a href="mailto:support@themvp.in">support@themvp.in</a> or visit <a href="https://themvp.in">themvp.in</a>.' })</div>
 <p class="muted">TheMVP service centre. Full technical data for our technicians: $(Enc (Split-Path $file -Leaf))</p>
 </body></html>
 "@

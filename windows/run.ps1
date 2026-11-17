@@ -46,7 +46,8 @@ if ($Ticket) {
 if (-not $Ticket -and (Get-ChildItem $out -Filter *.json -ErrorAction SilentlyContinue)) {
     Write-Host ""
     Write-Host "Done. Your results opened in your web browser. A copy is in: $out"
-    Write-Host "Need help with what it found? Email support@themvp.in or visit https://themvp.in"
+    if ((Get-CimInstance Win32_ComputerSystem).PCSystemType -eq 2) { Write-Host "TheMVP Support looks after desktop PCs, not laptops: for help with this laptop, contact its manufacturer." }
+    else { Write-Host "Need help with what it found? Email support@themvp.in or visit https://themvp.in" }
 } elseif ($zip) {
     Write-Host ""
     Write-Host "Done. Your report is on the Desktop: $($zip.Name)"

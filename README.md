@@ -82,6 +82,13 @@ After any change to the script, update the checksum: `cd linux && sha256sum them
   (recommended below 90 °C). [HWiNFO](https://www.hwinfo.com) also shows every temperature
   on screen, but the check cannot read its values.
 - **Linux:** processor and NVIDIA graphics temperatures are logged every 5 seconds.
+- **Virtual machines:** temperatures cannot be read, so the check leaves them out without a warning.
+
+## Laptops
+
+On a laptop the check also shows how much charge the battery still holds compared with when
+it was new (a battery below 70% is worth replacing). TheMVP Support looks after desktop PCs,
+not laptops: for help with a laptop, contact its manufacturer.
 
 ## What the report contains
 

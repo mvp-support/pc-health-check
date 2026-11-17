@@ -84,6 +84,23 @@ After any change to the script, update the checksum: `cd linux && sha256sum them
 - **Linux:** processor and NVIDIA graphics temperatures are logged every 5 seconds.
 - **Virtual machines:** temperatures cannot be read, so the check leaves them out without a warning.
 
+## Blue screens: which driver caused it
+
+The check reads the blue-screen error code from Windows' crash files, but cannot name the
+driver behind it without extra tools. To see the driver yourself, open the crash files
+(`C:\Windows\Minidump`, and copies in the report's `raw\dumps` folder) in
+[BlueScreenView](https://www.nirsoft.net/utils/blue_screen_view.html) (free, no install) or
+[WinDbg](https://aka.ms/windbg/download) (free, from Microsoft). The results page shows this tip
+whenever crash files are found.
+
+## Ask an AI assistant
+
+You can give the report to an AI assistant that can read files (for example ChatGPT, Claude or
+Gemini) and ask it what is wrong with your PC. Start with the one file that holds every result:
+`bench-….json` on Windows, `summary.json` on Linux. The `raw` folder has the full logs if the
+assistant asks for more. Before you upload it, remember the AI company receives everything in
+it, including the details listed under "What the report contains" below.
+
 ## Laptops
 
 On a laptop the check also shows how much charge the battery still holds compared with when
@@ -133,4 +150,7 @@ holds the details our technicians need, and some of them identify you or your PC
 | `windows/bench_collect.ps1` | The Windows check |
 | `linux/themvp-diag.sh` | The Linux check |
 
-Some Windows checks are adapted from StressLab by Cincy Power Computers, LLC (MIT License).
+## Licence
+
+MIT, see [LICENSE](LICENSE): anyone may use, change and share this tool. Some Windows checks
+are adapted from StressLab by Cincy Power Computers, LLC (MIT License, notice included in LICENSE).

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  TheMVP.in - Workstation Hang / Crash Diagnostic Collector  (Linux)
-#  Version: 1.5  (2026-11-17)  - graphics card PCIe lanes, monitor on the motherboard port, pstore crash records
+#  Version: 1.6  (2026-11-17)  - without a ticket: tip to ask an AI assistant about summary.json
+#           1.5  (2026-11-17)  - graphics card PCIe lanes, monitor on the motherboard port, pstore crash records
 #           1.4  (2026-11-16)  - INFO level (XMP on, non-persistent journal), owner wording without a ticket,
 #                                laptop battery wear, virtual machines skip sensor warnings
 #           1.3  (2026-11-12)  - ticket ID optional: without it the report is for the owner's own use
@@ -20,7 +21,7 @@
 #  smartmontools / rasdaemon / lm-sensors / stress-ng / gpu-burn (skip with --no-install).
 # =============================================================================
 
-VERSION="1.5"
+VERSION="1.6"
 TICKET=NOTICKET; case "${1:-}" in ""|-*) ;; *) TICKET="$1"; shift ;; esac   # no ticket: own-use run, options may come first
 TICKET="$(printf '%s' "$TICKET" | tr -cd 'A-Za-z0-9')"; [ -n "$TICKET" ] || TICKET=NOTICKET   # it becomes part of the file name
 STRESS_MIN=0; GPU_STRESS_MIN=0; DAYS=30; INSTALL=1
@@ -619,6 +620,9 @@ if [ "$TICKET" = "NOTICKET" ]; then
   echo "DONE. Your results are shown above. A copy is saved as:"
   echo "   $OUT.tar.gz"
   echo "Need help with what it found? $HELP"
+  echo "Second opinion: give $OUT/summary.json (all results in one file) to an AI assistant that can read"
+  echo "files, e.g. ChatGPT, Claude or Gemini; the raw folder next to it has the full logs. Before you upload it:"
+  echo "the AI company receives everything in it, including this PC's name, serial numbers and system logs."
 else
   echo "DONE. Please email this file to support by replying to your ticket email:"
   echo "   $OUT.tar.gz"

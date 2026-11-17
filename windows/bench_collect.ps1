@@ -49,7 +49,7 @@ param(
     [int]$Trace = 0
 )
 $ErrorActionPreference = "SilentlyContinue"
-$CollectorVersion = "1.4"
+$CollectorVersion = "1.5"
 $Ticket = $Ticket -replace '[^A-Za-z0-9]', ''   # it becomes part of the zip name
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 Start-Transcript -Path (Join-Path $Out "run.log") -Force | Out-Null   # the admin window closes at the end: keep what it showed
@@ -510,7 +510,13 @@ if (-not $gpuT -and $gpuTemps.Count) { $gpuT = ($gpuTemps | ForEach-Object { $_.
 if ($cpuT -or $gpuT) { $temps = [ordered]@{ cpu_max_c = $cpuT; gpu_max_c = $gpuT; gpus = $gpuTemps } }
 # Windows has no dependable built-in processor temperature reading: say how to get one
 $tempNote = $(if ($isVm) { "Virtual machine: temperatures are not available, the host computer's sensors are hidden from it." }
-    elseif (-not $cpuT -and -not $offline) { "Processor temperature is not included: Windows cannot read it by itself. To add it, install LibreHardwareMonitor (free, github.com/LibreHardwareMonitor/LibreHardwareMonitor), leave it open and run this check again. HWiNFO (hwinfo.com) also shows every temperature on screen." })
+    elseif (-not $cpuT -and -not $offline) { "Processor temperature is not included: Windows cannot read it by itself. To add it, install LibreHardwareMonitor (free, github.com/LibreHardwareMonitor/LibreHardwareMonitor), leave it open and run this check again. HWiNFO (hwinfo.com) also shows every temperature on screen." }
+    else { $null })   # every branch needs a value: an empty if becomes {} in the JSON
+# Without cdb.exe the dumps give the error code but not the driver: say how to see it (the tool is not shipped)
+# Shown exactly when the "Blue-screen crashes" line reports one (codes from the event log or a readable dump)
+$dumpNote = $(if (@(@($bugchecks) + @($dumps | ForEach-Object { $_.bugcheck }) | Where-Object { $_ }).Count -and -not @($dumps | Where-Object { $_.module }).Count) {
+    "To see which driver caused the blue screen, open the crash files in BlueScreenView (free, no install: nirsoft.net/utils/blue_screen_view.html) or WinDbg (free, from Microsoft: aka.ms/windbg/download). They are in $(Join-Path $Windows 'Minidump'); when this check runs as administrator, the report's raw\dumps folder has copies." }
+    else { $null })
 
 # --- live performance sample (+ optional WPR trace) --------------------------------------
 $stamp = "{0}-{1}" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd-HHmm")
@@ -709,6 +715,7 @@ $report = [ordered]@{
     device_errors = $deviceErrors
     temps         = $temps
     temp_note     = $tempNote
+    dump_note     = $dumpNote
     monitor_on_board = $monitorOnBoard
     battery       = $battery
     boot          = $boot
@@ -754,7 +761,13 @@ snapshot of system memory from the moment of the crash.</li>
 <b>What it did NOT do</b>: it did not open your documents, photos, e-mails or browser history, did not read
 passwords, and did not install, change or delete anything. $(if ($Server) { "The results went only to TheMVP's service desk." } else { "Nothing was sent anywhere. You decide whether to send the report." })</div>
 <h2>Results</h2><table>$rows</table>
+$(if ($dumpNote) { "<p class=`"muted`">$(Enc $dumpNote)</p>" })
 $(if ($tempNote) { "<p class=`"muted`">$(Enc $tempNote)</p>" })
+<div class="box" style="margin-top:16px"><b>Want a second opinion?</b> You can give this report to an AI assistant that can read files
+(for example ChatGPT, Claude or Gemini) and ask it what is wrong with your PC. Start with <code>$(Enc (Split-Path $file -Leaf))</code>:
+it holds every result in one file. The <code>raw</code> folder has the full logs if the assistant asks for more$(if ($Ticket) { ", and some assistants accept the whole .zip file" }).
+The report is in <code>$(Enc $Out)</code>.<br><b>Before you upload it:</b> the AI company receives everything in it, including this PC's
+name, your Windows user name and the system logs described above.</div>
 <div class="box" style="margin-top:16px">$(if ($isLaptop -and -not $Ticket) { "<b>Need help with this laptop?</b> TheMVP Support looks after desktop PCs, not laptops. Please contact $(Enc $computer.manufacturer) support or use the warranty that came with the laptop." }
   else { '<b>Need help with what this found?</b> Email <a href="mailto:support@themvp.in">support@themvp.in</a> or visit <a href="https://themvp.in">themvp.in</a>.' })</div>
 <p class="muted">TheMVP service centre. Full technical data for our technicians: $(Enc (Split-Path $file -Leaf))</p>
@@ -769,6 +782,7 @@ Write-Host ("Kernel-Power 41: {0} (no bugcheck: {1}) | WHEA: {2} | disk errors: 
 if ($boot.last_ms) { Write-Host ("Last boot: {0:N1} s | slowed by: {1}" -f ($boot.last_ms / 1000), (($culprits | ForEach-Object { $_.name }) -join ", ")) }
 if ($perf) { Write-Host ("Idle CPU {0}% | DPC {1}% | interrupts {2}% | disk busy {3}% | free RAM {4} MB" -f `
     $perf.cpu_pct, $perf.dpc_pct, $perf.interrupt_pct, $perf.disk_busy_pct, $perf.avail_mem_mb) }
+if ($dumpNote) { Write-Host $dumpNote -ForegroundColor Yellow }
 if ($tempNote) { Write-Host $tempNote -ForegroundColor Yellow }
 
 # --- raw evidence + one zip to send ------------------------------------------------------
